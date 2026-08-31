@@ -1,0 +1,4876 @@
+---
+title: "Attrition in Dog Survey"
+author: "Riqi Xu"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(svglite)
+library(tidyverse)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(survival)
+library(patchwork)
+library(flextable)
+library(officer)
+library(forcats)
+library(broom)
+library(ggrepel)
+```
+
+# Step 1: Preliminary Exploration of National Dog Survey 2023 Structure
+```{r}
+# Import Dataset with Strict Type Guessing Fix
+# Setting guess_max = Inf ensures text codes like 'NAQ' are not corrupted into logical NA
+data_path <- "NDS_2023_attrition_data.csv"
+raw_data <- read_csv(data_path, guess_max = Inf, show_col_types = FALSE)
+
+# Verify Full Dataset Dimensions
+data_structure <- tibble(records = nrow(raw_data), variables = ncol(raw_data),
+  character_columns = sum(map_lgl(raw_data, is.character)),
+  numeric_columns = sum(map_lgl(raw_data, is.numeric)),
+  logical_columns = sum(map_lgl(raw_data, is.logical)))
+print(data_structure)
+
+# Check Baseline Target Variable: Survey Completion Status
+completion_summary <- raw_data %>%
+  count(Finished, name = "responses") %>%
+  mutate(status = case_when(is.na(Finished) ~ "Missing",
+      Finished ~ "Completed", TRUE ~ "Not completed"),
+    percentage = round(responses / sum(responses) * 100, 2)) %>%
+  select(status, responses, percentage)
+print(completion_summary)
+```
+
+# Step 2: Locating the Precise Drop-out Points and Computing Hazards
+# Node-Level Timeline Tracking & Terminal Extraction
+```{r}
+# Step 2: Node-Level Timeline Tracking & Terminal Extraction
+# NAQ-aware version to capture visual exposure dropout
+
+# 2.1 Define raw question columns
+raw_question_columns <- names(raw_data)[10:247]
+
+# 2.2 Establish Raw-Field-to-Page-Node Mapping
+# Explicit mapping for fields displayed on the same page
+page_merge_map <- tribble(
+  ~raw_col,                         ~page_node_id,
+  
+  # Main owner route
+  "Q4_DogAge.1_1",                  "Q4_DogAge",
+  "Q4_DogAge.2_1",                  "Q4_DogAge",
+  "Q6.2_DogBreed_1",                "Q6.2_DogBreed",
+  "Q6.2_DogBreed_2",                "Q6.2_DogBreed",
+  "Q7_DogCrop",                     "Q7_DogCropDock",
+  "Q7_DogDock",                     "Q7_DogCropDock",
+  "Q14_Worries_Living",             "Q14_Worries",
+  "Q14_Worries_Employment",         "Q14_Worries",
+  "Q14_Worries_DailyRoutine",       "Q14_Worries",
+  "Q14_Worries_Family",             "Q14_Worries",
+  "Q14_Worries_CoL",                "Q14_Worries",
+  "Q15_CostPressure_1",             "Q15_CostPressure",
+  "Q15_CostPressure_2",             "Q15_CostPressure",
+  "Q15_CostPressure_3",             "Q15_CostPressure",
+  "Q15_CostPressure_4",             "Q15_CostPressure",
+  
+  # Second-dog route
+  "Q204_DogAge.1_1",                "Q204_DogAge",
+  "Q204_DogAge.2_1",                "Q204_DogAge",
+  "Q208_DogBreed_1",                "Q208_DogBreed",
+  "Q208_DogBreed_2",                "Q208_DogBreed",
+  "Q211_DogCrop",                   "Q211_DogCropDock",
+  "Q211_DogDock",                   "Q211_DogCropDock",
+  
+  # Third-dog route
+  "Q304_DogAge.1_1",                "Q304_DogAge",
+  "Q304_DogAge.2_1",                "Q304_DogAge",
+  "Q308_DogBreed_1",                "Q308_DogBreed",
+  "Q308_DogBreed_2",                "Q308_DogBreed",
+  "Q311_DogCrop",                   "Q311_DogCropDock",
+  "Q311_DogDock",                   "Q311_DogCropDock",
+  
+  # Fourth-dog route
+  "Q404_DogAge.1_1",                "Q404_DogAge",
+  "Q404_DogAge.2_1",                "Q404_DogAge",
+  "Q408_DogBreed_1",                "Q408_DogBreed",
+  "Q408_DogBreed_2",                "Q408_DogBreed",
+  "Q411_DogCrop",                   "Q411_DogCropDock",
+  "Q411_DogDoc",                    "Q411_DogCropDock",
+  
+  # Fifth-dog route
+  "Q504_DogAge.1_1",                "Q504_DogAge",
+  "Q504_DogAge.2_1",                "Q504_DogAge",
+  "Q508_DogBreed_1",                "Q508_DogBreed",
+  "Q508_DogBreed_2",                "Q508_DogBreed",
+  "Q511_DogCrop",                   "Q511_DogCropDock",
+  "Q511_DogDock",                   "Q511_DogCropDock",
+  
+  # E11 ethnicity selection and its optional text field
+  "E11.1_EthnicityText",            "E11_Ethnicity"
+)
+
+# Build final question_map combining regex logic and explicit mapping
+question_map <- tibble(
+  raw_col = raw_question_columns,
+  raw_order = seq_along(raw_question_columns)
+) %>%
+  mutate(base_node_id = raw_col %>%
+           str_replace("(_\\d+)?_TEXT$", "") %>%
+           str_replace("_text$", "")) %>%
+  left_join(page_merge_map, by = "raw_col") %>%
+  mutate(node_id = coalesce(page_node_id, base_node_id)) %>%
+  select(raw_col, raw_order, node_id)
+
+# Preserve chronological page order
+node_order <- question_map %>%
+  group_by(node_id) %>%
+  summarise(node_order = min(raw_order), .groups = "drop") %>%
+  arrange(node_order)
+
+node_ids <- node_order$node_id
+
+# 2.3 Define NAQ-aware recorded responses
+# This treats NAQ as a system-recorded visual exposure value, excluding true skip-logic blanks (NA) and empty strings
+is_recorded_response <- function(x) {
+  if (is.character(x) || is.factor(x)) {
+    y <- str_trim(as.character(x))
+    return(!is.na(y) & y != "")
+  } else {
+    return(!is.na(x))
+  }
+}
+
+# Valid substantive response:
+# excludes missing values, empty strings and the literal NAQ placeholder
+is_valid_response <- function(x) {
+  if (is.character(x) || is.factor(x)) {
+    y <- str_trim(as.character(x))
+
+    !is.na(y) &
+      y != "" &
+      str_to_upper(y) != "NAQ"
+  } else {
+    !is.na(x)
+  }
+}
+
+# Generate recorded-response matrix for raw columns
+raw_recorded_df <- raw_data %>%
+  select(all_of(raw_question_columns)) %>%
+  mutate(across(everything(), is_recorded_response))
+
+# 2.4 Aggregate into node-level recorded matrix (Logic OR Gate)
+# A node is TRUE if the parent or any merged child field has any recorded value, including NAQ
+recorded_node_matrix <- sapply(node_ids, function(nd) {
+  cols_for_node <- question_map$raw_col[question_map$node_id == nd]
+  
+  rowSums(
+    as.data.frame(raw_recorded_df[, cols_for_node, drop = FALSE]),
+    na.rm = TRUE
+  ) > 0
+})
+
+recorded_node_matrix <- as.matrix(recorded_node_matrix)
+storage.mode(recorded_node_matrix) <- "logical"
+
+# NAQ-aware recorded node count
+raw_data$nodes_seen <- rowSums(recorded_node_matrix, na.rm = TRUE)
+
+# 2.5 Extract terminal event node (Last recorded node, including NAQ)
+last_recorded_index <- apply(recorded_node_matrix, 1, function(row) {
+  idx <- which(row == TRUE)
+  
+  if (length(idx) == 0) {
+    return(NA_integer_)
+  }
+  
+  return(max(idx))
+})
+
+raw_data$terminal_node <- "Pre_Survey_Bounce"
+
+valid_recorded_terminal <- !is.na(last_recorded_index)
+
+raw_data$terminal_node[valid_recorded_terminal] <-
+  node_ids[last_recorded_index[valid_recorded_terminal]]
+
+# 2.6 Print final terminal dropout hotspots for validation
+terminal_hotspots_node <- raw_data %>%
+  filter(Finished == FALSE) %>%
+  count(terminal_node, sort = TRUE) %>%
+  mutate(percent = n / sum(n) * 100)
+
+print(head(terminal_hotspots_node, 15))
+
+
+raw_seen_df <- raw_data %>%
+  select(all_of(raw_question_columns)) %>% # 去掉了 dplyr:: 前缀
+  mutate(across(everything(), is_valid_response))
+
+seen_node_matrix <- sapply(node_ids, function(nd) {
+  cols_for_node <- question_map$raw_col[question_map$node_id == nd]
+  
+  rowSums(
+    as.data.frame(raw_seen_df[, cols_for_node, drop = FALSE]),
+    na.rm = TRUE
+  ) > 0
+})
+
+seen_node_matrix <- as.matrix(seen_node_matrix)
+storage.mode(seen_node_matrix) <- "logical"
+raw_data$nodes_seen <- rowSums(seen_node_matrix, na.rm = TRUE)
+```
+
+```{r}
+owner_answers <- c("One", "Two", "Three", "Four", "Five or more (please specify)")
+
+route_audit_data <- raw_data %>%
+  mutate(consent_clean = str_squish(
+      as.character(ConsentToSurvey) ),
+    consent_clean = na_if(consent_clean, ""),
+
+    q1_clean = str_squish( as.character(Q1_DogNumber) ),
+    q1_clean = na_if(q1_clean, ""),
+
+    finished_flag = str_to_upper(as.character(Finished)) == "TRUE",
+    questionnaire_entry = !is.na(consent_clean),
+    route_group = case_when( !questionnaire_entry ~ "Pre-questionnaire exit",
+
+      q1_clean %in% owner_answers ~ "Dog-owner",
+      q1_clean == "I don't have a dog" ~ "Non-owner",
+      TRUE ~  "Pre-route/undetermined"),
+
+    terminal_status = case_when(
+      route_group == "Pre-questionnaire exit" ~ "Pre-questionnaire exit",
+      consent_clean == "No" & finished_flag ~  "Consent declined (routed end)",
+      finished_flag ~  "Completed questionnaire",
+      TRUE ~ "Question-level breakoff" )
+  )
+```
+
+```{r}
+route_summary <- route_audit_data %>%
+  filter(questionnaire_entry) %>%
+  group_by(route_group) %>%
+  summarise(
+    entrants = n(),
+
+    completed_questionnaires =
+      sum(terminal_status == "Completed questionnaire"),
+
+    consent_declined =
+      sum(terminal_status == "Consent declined (routed end)"),
+
+    breakoffs =
+      sum(terminal_status == "Question-level breakoff"),
+
+    breakoff_rate = 100 * breakoffs / entrants,
+
+    .groups = "drop" ) %>%
+  mutate(
+    entrant_share = 100 * entrants / sum(entrants)
+  ) %>%
+  select( route_group, entrants, entrant_share, completed_questionnaires,
+    consent_declined, breakoffs, breakoff_rate)
+
+print(route_summary)
+```
+
+
+# Step 3: Empirical Baseline Lifetable & Survival Curve
+## Generate Node Metadata Dictionary for Feature Engineering
+```{r metadata-draft, eval=FALSE}
+# Step 3A & 3B: Generate Node Metadata Dictionary for Feature Engineering
+# Constructs a metadata dictionary to map structural and psychological traits to each survey node
+
+# Identify parent nodes that contain derivative child text-entry fields
+text_child_nodes <- question_map %>%
+  filter(str_detect(raw_col, "_TEXT$|_text$")) %>%
+  distinct(node_id) %>%
+  pull(node_id)
+
+# Build the foundational metadata dictionary
+node_metadata <- tibble(
+  node_id = node_ids
+) %>%
+  mutate(
+    # Route and branching logic indicators
+    route = case_when(
+      str_starts(node_id, "E") ~ "non_owner_exit",
+      str_detect(node_id, "^Q2(0[1-9]|1[0-9]|20)") ~ "second_dog",
+      str_detect(node_id, "^Q3(0[1-9]|1[0-9]|20)") ~ "third_dog",
+      str_detect(node_id, "^Q4(0[1-9]|1[0-9]|20)") ~ "fourth_dog",
+      str_detect(node_id, "^Q5(0[1-9]|1[0-9]|20)") ~ "fifth_dog",
+      TRUE ~ "owner_main"
+    ),
+    
+    route_simplified = case_when(
+      str_detect(route, "second_dog|third_dog|fourth_dog|fifth_dog") ~ "repeated_dogs_loop",
+      route == "non_owner_exit" ~ "non_owner_exit",
+      TRUE ~ "owner_main"
+    ),
+    
+    # Dimension 1: Cognitive Burden and UI Design Attributes
+    
+    # Identify true matrix/grid format questions
+    is_matrix = as.integer(
+      str_detect(node_id, "Matrix|Worries|Scale|Rating")
+    ),
+    
+    # Flag presence of child text entry boxes (e.g., 'Other, please specify')
+    has_child_text_entry = as.integer(
+      node_id %in% text_child_nodes
+    ),
+    
+    # Flag primary open-ended text questions
+    is_main_open_text = as.integer(
+      str_detect(node_id, "DogName|ImproveLife|WelfareIssues|Comment|Specify")
+    ),
+    
+    # Flag short text or personal input fields
+    is_short_text = as.integer(
+      str_detect(node_id, "Postcode|Phone|Email")
+    ),
+    
+    # Aggregate flag for any form of text entry requirement
+    has_text_entry = as.integer(
+      has_child_text_entry == 1 |
+        is_main_open_text == 1 |
+        is_short_text == 1
+    ),
+    
+    text_entry_type = case_when(
+      is_main_open_text == 1 ~ "main_open_text",
+      is_short_text == 1 ~ "short_text_identifier",
+      has_child_text_entry == 1 ~ "optional_child_text",
+      TRUE ~ "none"
+    ),
+    
+    # Placeholders for manual annotation based on the survey PDF
+    word_count = NA_integer_,
+    options_count = NA_integer_,
+    
+    # Flag questions with extensive response options
+    is_long_choice = as.integer(
+      str_detect(node_id, "ServicesCutCoL|HolidayAccommo|DogDaytime|DogSource|DogAversive")
+    ),
+    
+    # Dimension 2: Psychological Sensitivity and Topic Categorization
+    
+    privacy_level = case_when(
+      str_detect(node_id, "Postcode|Phone|Email|DogName") ~ "High",
+      str_detect(node_id, "Ethnicity|Gender|Age|Housing|Household|Education|Income") ~ "Medium",
+      TRUE ~ "Low"
+    ),
+    
+    financial_sensitivity = as.integer(
+      str_detect(node_id, "Cost|CoL|Vet|Insurance|Expense|Spend|Service|Money|Affordable")
+    ),
+    
+    topic_category = case_when(
+      str_detect(node_id, "DogName|DogNumber|DogAge|DogSex|DogBreed") ~ "Dog_Profile",
+      str_detect(node_id, "DogSource|DogRegionBorn|DogEuropeBorn|DogWorldBorn") ~ "Dog_Acquisition",
+      str_detect(node_id, "DogDaytime|DogWorkBarrier") ~ "Dog_Care_Routine",
+      str_detect(node_id, "DogReward|DogAversive|AversTool|Behaviour") ~ "Dog_Behavior",
+      str_detect(node_id, "Holiday") ~ "Dog_Holiday_Care",
+      str_detect(node_id, "Cost|CoL|Services|Vet|Insurance|Expense|Spend") ~ "Financial_Cost",
+      str_detect(node_id, "Welfare|DTInternational|DTFoster|GovRole|ImproveLife") ~ "Dog_Welfare",
+      str_detect(node_id, "Age|Gender|Ethnicity|Housing|Postcode|Household|Income") ~ "Owner_Demographics",
+      str_starts(node_id, "E") ~ "Non_Owner_Exit",
+      TRUE ~ "Other"
+    ),
+    
+    # Dimension 3: Recall Effort
+    
+    requires_precise_recall = as.integer(
+      str_detect(node_id, "When|Year|Month|Date|HowOften|Frequency|Spend|Cost|Amount|Age")
+    ),
+    
+    # Derived heuristic scores for robustness checks
+    
+    cognitive_burden_score = case_when(
+      is_matrix == 1 ~ 3L,
+      is_long_choice == 1 ~ 3L,
+      is_main_open_text == 1 ~ 3L,
+      has_text_entry == 1 ~ 2L,
+      requires_precise_recall == 1 ~ 2L,
+      TRUE ~ 1L
+    ),
+    
+    sensitivity_score = case_when(
+      privacy_level == "High" ~ 3L,
+      privacy_level == "Medium" ~ 2L,
+      financial_sensitivity == 1 ~ 2L,
+      TRUE ~ 1L
+    ),
+    
+    # Flag for nodes requiring strict manual verification
+    manual_check_needed = as.integer(
+      is_matrix == 1 |
+        has_text_entry == 1 |
+        is_long_choice == 1 |
+        privacy_level != "Low" |
+        financial_sensitivity == 1 |
+        requires_precise_recall == 1
+    ),
+    
+    manual_note = NA_character_
+  )
+
+# Export dictionary for subsequent manual refinement
+write_csv(node_metadata, "Survey_Node_Metadata_Dictionary_v3.csv")
+```
+
+
+## Appendix A
+```{r}
+node_metadata <- read_csv("Survey_Node_Metadata_refined.csv", show_col_types = FALSE)
+stopifnot(nrow(node_metadata) == 141, !anyDuplicated(node_metadata$node_id))
+```
+
+## Appendix_Table_A1_Node_Reconstruction
+```{r}
+q1_raw_order <- min(question_map$raw_order[question_map$node_id == "Q1_DogNumber"])
+
+table_a1 <- question_map %>%
+  group_by(node_id) %>%
+  summarise(
+    first_raw_order = min(raw_order),
+    `Number of source fields` = n_distinct(raw_col),
+    `Source raw field(s)` = paste(raw_col, collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    node_metadata %>% select(node_id, route_simplified) %>% distinct(),
+    by = "node_id"
+  ) %>%
+  arrange(first_raw_order) %>%
+  mutate(
+    `Analytical order` = row_number(),
+    `Questionnaire location` = case_when(
+      first_raw_order <= q1_raw_order ~ "Pre-route/common",
+      route_simplified == "owner_main" ~ "Dog-owner",
+      route_simplified == "repeated_dogs_loop" ~ "Repeated-dog module",
+      route_simplified == "non_owner_exit" ~ "Non-owner",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(
+    `Analytical order`,
+    `Node ID` = node_id,
+    `Questionnaire location`,
+    `Number of source fields`,
+    `Source raw field(s)`
+  )
+
+stopifnot(nrow(table_a1) == 141, !anyNA(table_a1$`Questionnaire location`))
+
+table_a1_ft <- flextable(table_a1) %>%
+  set_caption("Table A1. Analytical-node reconstruction dictionary") %>%
+  theme_booktabs() %>%
+  font(fontname = "Times New Roman", part = "all") %>%
+  fontsize(size = 8, part = "all") %>%
+  bold(part = "header") %>%
+  align(
+    j = c("Analytical order", "Number of source fields"),
+    align = "center",
+    part = "all"
+  ) %>%
+  valign(valign = "top", part = "all") %>%
+  width(j = "Analytical order", width = 0.55) %>%
+  width(j = "Node ID", width = 1.30) %>%
+  width(j = "Questionnaire location", width = 1.20) %>%
+  width(j = "Number of source fields", width = 0.65) %>%
+  width(j = "Source raw field(s)", width = 3.40) %>%
+  set_table_properties(
+  layout = "fixed",
+  opts_word = list(
+    split = FALSE,
+    repeat_headers = TRUE
+  )
+) %>%
+  add_footer_lines(
+    "Notes: Raw response fields displayed on the same questionnaire page were combined into one analytical node. Conditional free-text fields were retained within their parent page rather than treated as separate nodes."
+  ) %>%
+  italic(part = "footer") %>%
+  fontsize(size = 7.5, part = "footer")
+
+save_as_docx(
+  table_a1_ft,
+  path = "Appendix_Table_A1_Node_Reconstruction.docx",
+  pr_section = prop_section(
+    page_size = page_size(orient = "portrait"),
+    page_margins = page_mar(
+      top = 0.5, bottom = 0.5, left = 0.5, right = 0.5)
+  )
+)
+```
+
+
+## Appendix_Table_A2_Metadata_Definitions
+```{r}
+table_a2 <- tribble(
+  ~Variable, ~Definition, ~`Coding/unit`, ~`Analytical use`,
+  "route_simplified", "Analytical questionnaire route assigned to the node.", "owner_main; repeated_dogs_loop; non_owner_exit", "Route adjustment and route-specific analyses",
+  "has_text_entry", "Whether the node contains required or optional text entry.", "0 = no; 1 = yes", "Main Models 3 and 4",
+  "text_entry_type", "Type of text entry presented at the node.", "none; optional_child_text; main_open_text; short_text_identifier", "Metadata audit",
+  "options_count", "Number of coded response alternatives associated with the node.", "Count", "Response-format audit",
+  "is_long_choice", "Whether the node presents an extended choice set following questionnaire-layout review.", "0 = no; 1 = yes", "Main Models 3 and 4",
+  "privacy_level", "Level of personal or identifying information requested.", "Low; Medium; High", "Main Models 3 and 4",
+  "financial_sensitivity", "Whether the node concerns expenditure, affordability or financial pressure.", "0 = no; 1 = yes", "Main Models 3 and 4",
+  "prompt_word_count", "Number of words in the question or information prompt.", "Words", "Reading-burden measurement",
+  "prompt_wc_10", "Prompt length expressed per ten words.", "prompt_word_count / 10", "Main Models 3 and 4",
+  "prompt_wc_band_tertile", "Categorical prompt-length measure calculated during analysis.", "Low; Medium; High", "Reading-burden sensitivity analysis",
+  "option_word_count_visible", "Number of words in visible response-option labels.", "Words", "Alternative reading-burden specification",
+  "total_visible_word_count", "Combined number of prompt and visible option-label words.", "Words", "Alternative reading-burden specification",
+  "topic_category", "Substantive topic assigned to the node.", "Categorical", "Topic-category extension",
+  "cognitive_burden_score", "Ordinal summary of coded cognitive demands.", "1 = low; 2 = moderate; 3 = high", "Cognitive-burden extension"
+)
+
+table_a2_ft <- flextable(table_a2) %>%
+  set_caption("Table A2. Definitions and coding of node-level metadata variables") %>%
+  theme_booktabs() %>%
+  font(fontname = "Times New Roman", part = "all") %>%
+  fontsize(size = 8.5, part = "all") %>%
+  bold(part = "header") %>%
+  valign(valign = "top", part = "all") %>%
+  width(j = "Variable", width = 1.4) %>%
+  width(j = "Definition", width = 2.7) %>%
+  width(j = "Coding/unit", width = 1.2) %>%
+  width(j = "Analytical use", width = 1.65) %>%
+  set_table_properties(
+    layout = "fixed",
+    opts_word = list(split = TRUE, repeat_headers = TRUE)
+  ) %>%
+  add_footer_lines(
+    "Notes: Binary indicators use 1 for yes and 0 for no. Shared pre-route/common nodes are coded within owner_main in the analytical metadata. The long-choice indicator was assigned following questionnaire-layout review rather than mechanically from options_count. The legacy word_count_band field was not used in the final categorical sensitivity analysis."
+  ) %>%
+  italic(part = "footer") %>%
+  fontsize(size = 7.5, part = "footer")
+
+save_as_docx(
+  table_a2_ft,
+  path = "Appendix_Table_A2_Metadata_Definitions.docx",
+  pr_section = prop_section(
+    page_size = page_size(orient = "portrait"),
+    page_margins = page_mar(top = 0.65, bottom = 0.65, left = 0.65, right = 0.65)
+  )
+)
+```
+
+
+
+
+# Step 4: Building Hybrid Person-Period Data
+```{r}
+# Step 4: Transforming Wide Data to Long Person-Period Survival Matrix
+# Integrates the valid-response trajectory with the NAQ-aware terminal event node
+
+# Extract chronological node order
+node_order_tbl <- tibble(
+  node_id = node_ids,
+  node_order = seq_along(node_ids)
+)
+
+# 1. Initialize the analysis matrix from the valid-response baseline
+analysis_node_matrix <- seen_node_matrix
+
+# Identify unfinished respondents eligible for the node-level attrition model
+eligible_event <- (
+  raw_data$Finished == FALSE &
+  raw_data$nodes_seen > 0 &
+  raw_data$terminal_node != "Pre_Survey_Bounce"
+)
+
+# Locate the column index of each respondent's terminal event node
+terminal_column_index <- match(
+  raw_data$terminal_node[eligible_event],
+  node_ids
+)
+
+if (anyNA(terminal_column_index)) {
+  stop("Critical Error: Some terminal_node values are not present in node_ids.")
+}
+
+# 2. Inject the terminal NAQ node into the analysis matrix
+# This preserves the visually exposed fatal node before wide-to-long transformation
+analysis_node_matrix[
+  cbind(
+    which(eligible_event),
+    terminal_column_index
+  )
+] <- TRUE
+
+nodes_in_analysis <- rowSums(
+  analysis_node_matrix,
+  na.rm = TRUE
+)
+
+# 3. Transform to longitudinal person-period format
+person_period_data <- as_tibble(
+  analysis_node_matrix,
+  .name_repair = "minimal"
+) %>%
+  mutate(
+    ResponseId = raw_data$ResponseId,
+    Finished = raw_data$Finished,
+    terminal_node = raw_data$terminal_node,
+    nodes_in_analysis = nodes_in_analysis
+  ) %>%
+  filter(nodes_in_analysis > 0) %>%
+  pivot_longer(
+    cols = all_of(node_ids),
+    names_to = "node_id",
+    values_to = "in_analysis"
+  ) %>%
+  filter(in_analysis == TRUE) %>%
+  left_join(node_order_tbl, by = "node_id") %>%
+  group_by(ResponseId) %>%
+  arrange(node_order, .by_group = TRUE) %>%
+  mutate(
+    time_step = row_number(),
+    total_nodes = n(),
+    
+    # Dynamically assign the hazard event flag (1 = dropout, 0 = censored/survived)
+    event = as.integer(
+      Finished == FALSE &
+      node_id == terminal_node
+    )
+  ) %>%
+  ungroup()
+```
+
+
+## Step 4 Audit: Validating Event Consistency
+```{r}
+cat("\n--- Step 4 Audit ---\n")
+cat("Long data dimensions:", nrow(person_period_data), "rows\n")
+cat("Respondents represented:", n_distinct(person_period_data$ResponseId), "\n")
+
+# Calculate expected vs observed events
+expected_events <- sum(raw_data$Finished == FALSE & raw_data$terminal_node != "Pre_Survey_Bounce", na.rm = TRUE)
+observed_events <- sum(person_period_data$event, na.rm = TRUE)
+
+cat("Expected events:", expected_events, "\n")
+cat("Observed events:", observed_events, "\n")
+
+# Verify that no respondent has more than one event
+event_count_check <- person_period_data %>%
+  group_by(ResponseId) %>%
+  summarise(event_count = sum(event), .groups = "drop")
+
+cat("\nEvent-count distribution:\n")
+print(table(event_count_check$event_count))
+```
+
+## figure3: survival curve
+```{r}
+# Step 4B: Overall and Route-Conditional Empirical Survival Curves
+
+# 1. Construct one survival record per analytical respondent
+respondent_survival <- person_period_data %>%
+  group_by(ResponseId) %>%
+  summarise(
+    time = max(time_step, na.rm = TRUE),
+    status = max(event, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    raw_data %>%
+      transmute(
+        ResponseId,
+        q1_clean = str_squish(as.character(Q1_DogNumber)),
+        q1_clean = na_if(q1_clean, "")
+      ),
+    by = "ResponseId"
+  ) %>%
+  mutate(
+    route_group = case_when(
+      q1_clean %in% owner_answers ~ "Owner",
+      q1_clean == "I don't have a dog" ~ "Non-owner",
+      TRUE ~ "Pre-route/undetermined"
+    )
+  )
+
+# 2. Panel A data: all survey records
+# Respondents absent from person_period_data did not reach a
+# reconstructable analytical node. Unfinished cases are therefore
+# assigned an event at operational time zero.
+
+overall_survival_data <- raw_data %>%
+  select(ResponseId, Finished, terminal_node) %>%
+  left_join(
+    respondent_survival %>%
+      select(ResponseId, time, status),
+    by = "ResponseId"
+  ) %>%
+  mutate(
+    time = coalesce(time, 0L),
+    status = coalesce(
+      status,
+      as.integer(Finished == FALSE)
+    )
+  )
+
+# 3. Audit the sample before fitting the curves
+
+panel_a_audit <- overall_survival_data %>%
+  summarise(
+    total_records = n(),
+    pre_survey_bounces = sum(time == 0 & status == 1, na.rm = TRUE),
+    survival_after_entry = 1 -
+      pre_survey_bounces / total_records
+  )
+
+route_audit <- respondent_survival %>%
+  group_by(route_group) %>%
+  summarise(
+    entrants = n(),
+    completed_or_censored = sum(status == 0),
+    breakoffs = sum(status == 1),
+    attrition_rate = breakoffs / entrants,
+    .groups = "drop"
+  ) %>%
+  bind_rows(
+    respondent_survival %>%
+      summarise(
+        route_group = "Overall",
+        entrants = n(),
+        completed_or_censored = sum(status == 0),
+        breakoffs = sum(status == 1),
+        attrition_rate = breakoffs / entrants
+      )
+  )
+
+cat("\n--- Survival Figure Audit ---\n")
+print(panel_a_audit)
+print(route_audit)
+
+# Expected latest-sample values:
+# total_records        = 369,071
+# pre_survey_bounces   = 27,274
+# survival_after_entry = 92.61%
+#
+# Overall analytical sample     = 341,797
+# Owner entrants                = 321,229
+# Non-owner entrants            = 15,737
+# Pre-route/undetermined        = 4,831
+# Locatable breakoffs           = 95,034
+
+# Stop if the reconstructed samples do not reconcile
+stopifnot(
+  nrow(overall_survival_data) == nrow(raw_data),
+  nrow(respondent_survival) ==
+    dplyr::n_distinct(person_period_data$ResponseId),
+  sum(respondent_survival$status) ==
+    sum(person_period_data$event)
+)
+```
+
+
+
+```{r}
+# 4. Function for extracting Kaplan-Meier estimates
+
+extract_km <- function(data, curve_label, add_start = TRUE) {
+
+  fit <- survival::survfit(
+    survival::Surv(time, status) ~ 1,
+    data = data,
+    conf.type = "log-log"
+  )
+
+  fit_summary <- summary(fit)
+
+  curve_data <- tibble(
+    time = fit_summary$time,
+    survival = fit_summary$surv,
+    lower = fit_summary$lower,
+    upper = fit_summary$upper,
+    curve = curve_label
+  )
+
+  # Explicitly add S(0) = 1 so that every curve visibly begins at 100%.
+  # For Panel A, the next row is also at t = 0 and therefore produces
+  # the immediate vertical fall caused by pre-survey bounces.
+  if (add_start) {
+    curve_data <- bind_rows(
+      tibble(
+        time = 0,
+        survival = 1,
+        lower = 1,
+        upper = 1,
+        curve = curve_label
+      ),
+      curve_data
+    )
+  }
+
+  curve_data
+}
+
+# 5. Panel A: all records, including the time-zero breakoff
+
+panel_a_data <- extract_km(
+  data = overall_survival_data,
+  curve_label = "All survey records"
+)
+
+n_total <- nrow(overall_survival_data)
+
+n_bounce <- sum(
+  overall_survival_data$time == 0 &
+    overall_survival_data$status == 1,
+  na.rm = TRUE
+)
+
+initial_survival <- 1 - n_bounce / n_total
+
+bounce_label <- paste0(
+  "Pre-survey bounce: n = ",
+  scales::comma(n_bounce),
+  " (",
+  scales::percent(n_bounce / n_total, accuracy = 0.01),
+  ")"
+)
+
+panel_a <- ggplot(
+  panel_a_data,
+  aes(x = time, y = survival)
+) +
+  geom_ribbon(
+    aes(ymin = lower, ymax = upper),
+    fill = "#5B6573",
+    alpha = 0.14
+  ) +
+  geom_step(
+    color = "#273746",
+    linewidth = 1.15,
+    direction = "hv"
+  ) +
+  annotate(
+    "label",
+    x = 3,
+    y = 0.965,
+    label = bounce_label,
+    size = 3.5,
+    hjust = 0,
+    linewidth = 0.2,
+    fill = "white"
+  ) +
+  scale_x_continuous(
+    breaks = scales::breaks_width(5),
+    expand = expansion(mult = c(0.015, 0.02))
+  ) +
+  scale_y_continuous(
+  labels = scales::percent_format(accuracy = 1),
+  breaks = seq(0.5, 1, by = 0.05),
+  minor_breaks = NULL
+  ) +
+  coord_cartesian(ylim = c(0.5, 1)) +
+  labs(
+    title = "Overall survey survival",
+    subtitle = paste0(
+      "All ",
+      scales::comma(n_total),
+      " records; survival falls from 100% to ",
+      scales::percent(initial_survival, accuracy = 0.01),
+      " at questionnaire entry"
+    ),
+    x = "Cumulative operational nodes encountered",
+    y = "Survival probability"
+  ) +
+  theme_minimal(base_size = 12.5) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "#5D6D7E", size = 10.5),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+# 6. Panel B: route-conditional analytical survival
+
+panel_b_data <- bind_rows(
+  extract_km(
+    respondent_survival,
+    "Overall"
+  ),
+  extract_km(
+    respondent_survival %>%
+      filter(route_group == "Owner"),
+    "Owner"
+  ),
+  extract_km(
+    respondent_survival %>%
+      filter(route_group == "Non-owner"),
+    "Non-owner"
+  )
+) %>%
+  mutate(
+    curve = factor(
+      curve,
+      levels = c("Overall", "Owner", "Non-owner")
+    )
+  )
+
+curve_colours <- c(
+  "Overall" = "#273746",
+  "Owner" = "#2874A6",
+  "Non-owner" = "#D35400"
+)
+
+panel_b <- ggplot(
+  panel_b_data,
+  aes(
+    x = time,
+    y = survival,
+    colour = curve,
+    fill = curve,
+    group = curve
+  )
+) +
+  geom_ribbon(
+    aes(ymin = lower, ymax = upper),
+    alpha = 0.07,
+    colour = NA
+  ) +
+  geom_step(
+    linewidth = 1.1,
+    direction = "hv"
+  ) +
+  scale_colour_manual(values = curve_colours) +
+  scale_fill_manual(values = curve_colours) +
+  scale_x_continuous(
+    breaks = scales::breaks_width(5),
+    expand = expansion(mult = c(0.015, 0.02))
+  ) +
+  scale_y_continuous(
+  labels = scales::percent_format(accuracy = 1),
+  breaks = seq(0.5, 1, by = 0.05),
+  minor_breaks = NULL
+  ) +
+  coord_cartesian(ylim = c(0.5, 1)) +
+  guides(
+    fill = "none",
+    colour = guide_legend(
+      title = NULL,
+      override.aes = list(linewidth = 1.3)
+    )
+  ) +
+  labs(
+    title = "Route-conditional survival",
+    subtitle = paste0(
+      "Conditional on entry into a reconstructable trajectory (n = ",
+      scales::comma(nrow(respondent_survival)),
+      ")"
+    ),
+    x = "Cumulative operational nodes encountered",
+    y = "Survival probability",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 12.5) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "#5D6D7E", size = 10.5),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "top",
+    legend.justification = "left"
+  )
+
+# 7. Combine Panel A and Panel B
+figure3_overall_route_survival <- panel_a / panel_b +
+  patchwork::plot_layout(heights = c(1, 1.15)) +
+  patchwork::plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 13),
+      plot.margin = margin(10, 15, 10, 15)
+    )
+  )
+
+print(figure3_overall_route_survival)
+
+# High-resolution output for the dissertation
+ggsave(
+  filename = "figure3-overall-route-survival.png",
+  plot = figure3_overall_route_survival,
+  width = 10,
+  height = 10,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+
+
+# Step 5
+## Step 5A: Empirical Node-Level Hazard and Attrition Volume
+```{r}
+# Computes absolute dropout volume, empirical hazard rates, and proportional share per node
+
+# 1. Construct the consolidated node-level risk table
+node_risk_table <- person_period_data %>%
+  group_by(node_id) %>%
+  summarise(
+    node_order = first(node_order),
+    at_risk_n = n(),
+    dropouts = sum(event, na.rm = TRUE),
+    dropout_rate = dropouts / at_risk_n,
+    .groups = "drop"
+  ) %>%
+  # Calculate the proportional contribution of each node to the total attrition pool
+  mutate(
+    dropout_share = dropouts / sum(dropouts) * 100
+  )
+
+# 2. Identify top nodes by absolute dropout volume
+# Highlights questions responsible for the highest raw number of lost respondents
+top_by_volume <- node_risk_table %>%
+  arrange(desc(dropouts))
+
+# 3. Identify top nodes by empirical hazard (dropout rate)
+# Applies a minimum risk set threshold (n >= 500) to prevent small-sample variance on rare branching routes
+top_by_rate <- node_risk_table %>%
+  filter(at_risk_n >= 500) %>%
+  arrange(desc(dropout_rate))
+
+print(top_by_volume, n = 20)
+print(top_by_rate, n = 20)
+```
+
+
+## Step 5B: One-vs-Rest Item-Specific Hazard Models
+```{r}
+# Fits discrete-time logistic models for eligible nodes against the survey baseline,
+# controlling for non-linear time, with Benjamini-Hochberg (BH) FDR correction.
+
+# 1. Select the 17 focal nodes for presentation (Union of Top 10 by Count and Rate)
+top10_by_count <- node_risk_table %>%
+  arrange(desc(dropouts)) %>%
+  slice_head(n = 10) %>%
+  pull(node_id)
+
+top10_by_rate <- node_risk_table %>%
+  filter(at_risk_n >= 500) %>%
+  arrange(desc(dropout_rate)) %>%
+  slice_head(n = 10) %>%
+  pull(node_id)
+
+focal_nodes_to_display <- union(top10_by_count, top10_by_rate)
+
+# 2. Define the global family of eligible nodes for multiple testing correction
+# Restricts the testing universe to nodes with sufficient risk set size to prevent sparse data bias
+eligible_nodes <- node_risk_table %>%
+  filter(at_risk_n >= 500) %>%
+  pull(node_id)
+
+# Validate that all selected focal nodes are within the eligible testing family
+ineligible_focal_nodes <- setdiff(focal_nodes_to_display, eligible_nodes)
+if (length(ineligible_focal_nodes) > 0) {
+  stop(paste("Critical Error: Focal nodes failed sample size criterion:", paste(ineligible_focal_nodes, collapse = ", ")))
+}
+
+# 3. Aggregate long format person-period data into grouped binomial format
+# Losslessly compresses the dataset for rapid generalized linear modeling
+hazard_by_node <- person_period_data %>%
+  group_by(time_step, node_id) %>%
+  summarise(
+    events = sum(event, na.rm = TRUE),
+    trials = n(),
+    non_events = trials - events,
+    .groups = "drop"
+  )
+
+# 4. Function: Fit a One-vs-Rest grouped binomial GLM for a target node
+# Evaluates the excess hazard of a specific node relative to the prevailing baseline retention trend
+fit_one_node <- function(target_node_name) {
+  
+  dat <- hazard_by_node %>%
+    mutate(
+      target = as.integer(node_id == target_node_name)
+    ) %>%
+    group_by(time_step, target) %>%
+    summarise(
+      events = sum(events, na.rm = TRUE),
+      trials = sum(trials, na.rm = TRUE),
+      non_events = trials - events,
+      .groups = "drop"
+    ) %>%
+    # Scale time by 10 to ensure numerical stability and proper convergence of polynomial terms
+    mutate(
+      time_10 = time_step / 10,
+      time_10_sq = time_10^2
+    )
+
+  fit <- glm(
+    cbind(events, non_events) ~ time_10 + time_10_sq + target,
+    family = binomial(link = "logit"),
+    data = dat
+  )
+
+  coefs <- summary(fit)$coefficients
+  est <- coefs["target", "Estimate"]
+  se  <- coefs["target", "Std. Error"]
+  p   <- coefs["target", "Pr(>|z|)"]
+
+  tibble(
+    node_id = target_node_name,
+    Odds_Ratio = exp(est),
+    conf.low = exp(est - 1.96 * se),
+    conf.high = exp(est + 1.96 * se),
+    p.value = p
+  )
+}
+
+# 5. Execute models across all eligible nodes and apply False Discovery Rate (FDR) correction
+all_eligible_node_results <- map_dfr(eligible_nodes, fit_one_node) %>%
+  left_join(node_risk_table, by = "node_id") %>%
+  mutate(
+    # Apply Benjamini-Hochberg procedure across the entire family of eligible tests
+    p.adj_all_eligible = p.adjust(p.value, method = "BH"),
+    dropout_rate_percent = dropout_rate * 100
+  )
+
+# 6. Filter results to display only the focal nodes while retaining the globally corrected p-values
+node_test_results <- all_eligible_node_results %>%
+  filter(node_id %in% focal_nodes_to_display) %>%
+  mutate(
+    significance_all_eligible = case_when(
+      p.adj_all_eligible < 0.001 ~ "***",
+      p.adj_all_eligible < 0.01  ~ "**",
+      p.adj_all_eligible < 0.05  ~ "*",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  arrange(desc(Odds_Ratio)) %>%
+  select(
+    node_id, at_risk_n, dropouts, dropout_rate_percent, dropout_share, 
+    Odds_Ratio, conf.low, conf.high, p.adj_all_eligible, significance_all_eligible
+  )
+
+print(node_test_results, n = Inf, width = Inf)
+```
+
+## Appendix B
+```{r}
+format_p <- function(x) ifelse(x < .001, "<.001", sprintf("%.3f", x))
+
+table_b1 <- all_eligible_node_results %>%
+  filter(node_id %in% focal_nodes_to_display) %>%
+  left_join(
+    node_metadata %>% select(node_id, route_simplified) %>% distinct(),
+    by = "node_id"
+  ) %>%
+  mutate(
+    location = case_when(
+      node_id == "ConsentToSurvey" | str_starts(node_id, "W") |
+        node_id == "Q1_DogNumber" ~ "Pre-route/common",
+      route_simplified == "owner_main" ~ "Dog-owner",
+      route_simplified == "repeated_dogs_loop" ~ "Repeated-dog",
+      route_simplified == "non_owner_exit" ~ "Non-owner",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  arrange(desc(Odds_Ratio)) %>%
+  transmute(
+    Location = location,
+    Node = str_replace_all(node_id, "_", "_\n"),
+    `At risk` = scales::comma(at_risk_n),
+    Breakoffs = scales::comma(dropouts),
+    `Empirical hazard` = scales::percent(dropout_rate, accuracy = 0.01),
+    `Time-adjusted OR (95% CI)` = sprintf(
+      "%.3f (%.3f–%.3f)",
+      Odds_Ratio,
+      conf.low,
+      conf.high
+    ),
+    `p-value (raw / BH)` = paste0(
+      format_p(p.value),
+      " / ",
+      format_p(p.adj_all_eligible)
+    )
+  )
+
+stopifnot(
+  nrow(table_b1) == length(focal_nodes_to_display),
+  !anyNA(table_b1$Location)
+)
+
+table_b1_ft <- flextable(table_b1) %>%
+  set_caption(
+    "Table B1. Time-adjusted one-versus-rest results for focal questionnaire nodes"
+  ) %>%
+  theme_booktabs() %>%
+  font(fontname = "Times New Roman", part = "all") %>%
+  fontsize(size = 7.5, part = "all") %>%
+  bold(part = "header") %>%
+  align(
+    j = c(
+      "At risk",
+      "Breakoffs",
+      "Empirical hazard",
+      "Time-adjusted OR (95% CI)",
+      "p-value (raw / BH)"
+    ),
+    align = "center",
+    part = "all"
+  ) %>%
+  valign(valign = "top", part = "all") %>%
+  padding(padding = 2, part = "all") %>%
+  width(j = "Location", width = 0.90) %>%
+  width(j = "Node", width = 1.25) %>%
+  width(j = "At risk", width = 0.65) %>%
+  width(j = "Breakoffs", width = 0.65) %>%
+  width(j = "Empirical hazard", width = 0.75) %>%
+  width(j = "Time-adjusted OR (95% CI)", width = 1.45) %>%
+  width(j = "p-value (raw / BH)", width = 0.90) %>%
+  set_table_properties(
+    layout = "fixed",
+    opts_word = list(split = FALSE, repeat_headers = TRUE)
+  ) %>%
+  add_footer_lines(
+    paste(
+      "Notes: Focal nodes comprise the union of the ten nodes with the",
+      "largest breakoff counts and the ten nodes with the highest empirical",
+      "hazards among nodes with at least 500 at-risk exposures.",
+      "Odds ratios compare each focal node with all other questionnaire nodes",
+      "after adjustment for linear and quadratic operational time.",
+      "BH-adjusted p-values were calculated across all eligible nodes."
+    )
+  ) %>%
+  italic(part = "footer") %>%
+  fontsize(size = 7, part = "footer")
+
+save_as_docx(
+  table_b1_ft,
+  path = "Appendix_Table_B1_Focal_Node_Models.docx",
+  pr_section = prop_section(
+    page_size = page_size(orient = "portrait"),
+    page_margins = page_mar(
+      top = 0.6,
+      bottom = 0.6,
+      left = 0.6,
+      right = 0.6
+    )
+  )
+)
+```
+
+## Full_Node_Level_Results
+```{r}
+full_node_results <- node_risk_table %>%
+  left_join(
+    all_eligible_node_results %>%
+      select(
+        node_id,
+        Odds_Ratio,
+        conf.low,
+        conf.high,
+        p.value,
+        p.adj_all_eligible
+      ),
+    by = "node_id"
+  ) %>%
+  mutate(
+    eligible_one_vs_rest = at_risk_n >= 500,
+    exclusion_reason = if_else(
+      eligible_one_vs_rest,
+      NA_character_,
+      "At-risk exposure count below 500"
+    )
+  ) %>%
+  arrange(node_order)
+
+stopifnot(nrow(full_node_results) == 141)
+
+write_csv(
+  full_node_results,
+  "Full_Node_Level_Results.csv"
+)
+```
+
+
+## Figure 4: Raw Attrition Hotspots
+```{r}
+# 1. Audit the person-period structure
+# Each respondent should appear only once at each analytical node
+duplicate_exposures <- person_period_data %>%
+  count(ResponseId, node_id, name = "n_rows") %>%
+  filter(n_rows > 1)
+
+if (nrow(duplicate_exposures) > 0) {
+  stop(
+    "Duplicate respondent-node exposures were detected. ",
+    "Check person_period_data before calculating node-level hazards."
+  )
+}
+
+# One route classification per analytical node
+node_route_lookup <- node_metadata %>%
+  select(node_id, route_simplified) %>%
+  distinct()
+
+duplicate_route_labels <- node_route_lookup %>%
+  count(node_id, name = "n_routes") %>%
+  filter(n_routes > 1)
+
+if (nrow(duplicate_route_labels) > 0) {
+  stop(
+    "Some node_ids have more than one route_simplified value ",
+    "in node_metadata."
+  )
+}
+
+# 3. Construct the node-level hotspot table
+node_hotspots <- person_period_data %>%
+  group_by(node_id) %>%
+  summarise(
+    # Number of respondents who encountered the node
+    at_risk_n = n(),
+
+    # Number who broke off at the node
+    breakoff_n = sum(event == 1, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    empirical_hazard = breakoff_n / at_risk_n
+  ) %>%
+  left_join(
+    node_route_lookup,
+    by = "node_id"
+  ) %>%
+  mutate(
+    # Use metadata first, with node-name rules as a fallback
+    route_group = case_when(
+  route_simplified == "owner_main" ~ "Entry / owner route",
+  route_simplified == "repeated_dogs_loop" ~ "Repeated-dog loop",
+  route_simplified == "non_owner_exit" ~ "Non-owner",
+
+  str_detect(as.character(node_id), "^E") ~ "Non-owner",
+  str_detect(as.character(node_id), "^Q[2-5][0-9]{2}") ~
+    "Repeated-dog loop",
+  TRUE ~ "Entry / owner route"),
+
+  route_group = factor(
+  route_group,
+  levels = c(
+    "Entry / owner route",
+    "Repeated-dog loop",
+    "Non-owner")),
+
+    node_label = as.character(node_id)
+  )
+
+# 4. Audit totals
+total_locatable_breakoffs <- sum(
+  node_hotspots$breakoff_n,
+  na.rm = TRUE
+)
+
+cat("\n--- Figure 4 Audit ---\n")
+cat(
+  "Analytical nodes:",
+  nrow(node_hotspots),
+  "\n"
+)
+cat(
+  "Total node exposures:",
+  comma(sum(node_hotspots$at_risk_n)),
+  "\n"
+)
+cat(
+  "Total locatable breakoffs:",
+  comma(total_locatable_breakoffs),
+  "\n"
+)
+
+# Each breakoff respondent should contribute exactly one event
+stopifnot(
+  total_locatable_breakoffs ==
+    sum(person_period_data$event, na.rm = TRUE)
+)
+
+# Expected final-sample value
+if (total_locatable_breakoffs != 95034) {
+  warning(
+    "The total number of locatable breakoffs is ",
+    comma(total_locatable_breakoffs),
+    ", rather than the expected final value of 95,034. ",
+    "Check that the latest person_period_data object is being used."
+  )
+}
+
+# 5. Select the two Top 10 sets
+
+# Panel A: largest absolute number of breakoffs
+top_count_nodes <- node_hotspots %>%
+  filter(breakoff_n > 0) %>%
+  mutate(
+    breakoff_share =
+      breakoff_n / total_locatable_breakoffs
+  ) %>%
+  slice_max(
+    order_by = breakoff_n,
+    n = 10,
+    with_ties = FALSE
+  ) %>%
+  arrange(breakoff_n) %>%
+  mutate(
+    node_label = factor(
+      node_label,
+      levels = node_label
+    ),
+    count_annotation = paste0(
+      comma(breakoff_n),
+      "  (",
+      percent(breakoff_share, accuracy = 0.1),
+      ")"
+    )
+  )
+
+# Panel B: largest conditional hazards among stable risk sets
+top_hazard_nodes <- node_hotspots %>%
+  filter(
+    at_risk_n >= 500,
+    breakoff_n > 0
+  ) %>%
+  slice_max(
+    order_by = empirical_hazard,
+    n = 10,
+    with_ties = FALSE
+  ) %>%
+  arrange(empirical_hazard) %>%
+  mutate(
+    node_label = factor(
+      node_label,
+      levels = node_label
+    ),
+    hazard_annotation = paste0(
+      percent(empirical_hazard, accuracy = 0.1),
+      "  (n at risk = ",
+      comma(at_risk_n),
+      ")"
+    )
+  )
+
+cat("\nTop 10 by breakoff count:\n")
+print(
+  top_count_nodes %>%
+    select(
+      node_id,
+      route_group,
+      at_risk_n,
+      breakoff_n,
+      breakoff_share,
+      empirical_hazard
+    )
+)
+
+cat("\nTop 10 by conditional hazard:\n")
+print(
+  top_hazard_nodes %>%
+    select(
+      node_id,
+      route_group,
+      at_risk_n,
+      breakoff_n,
+      empirical_hazard
+    )
+)
+```
+
+
+```{r}
+# 6. Common colour scheme
+route_colours <- c(
+  "Entry / owner route" = "#2C7FB8",
+  "Repeated-dog loop" = "#41AE76",
+  "Non-owner" = "#D95F0E"
+)
+
+common_theme <- theme_minimal(base_size = 11.5) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(
+      colour = "#273746",
+      size = 9.5,
+      lineheight = 0.95
+    ),
+    axis.text.x = element_text(
+      colour = "#273746"
+    ),
+    plot.title = element_text(
+      face = "bold",
+      size = 13
+    ),
+    plot.subtitle = element_text(
+      size = 9.5,
+      colour = "#5D6D7E",
+      margin = margin(b = 7)
+    ),
+    legend.position = "top",
+    legend.justification = "left",
+    legend.title = element_blank(),
+    plot.margin = margin(
+      t = 6,
+      r = 40,
+      b = 6,
+      l = 6
+    )
+  )
+
+# 7. Panel A: Top 10 by breakoff count
+
+panel_a_hotspots <- ggplot(
+  top_count_nodes,
+  aes(
+    x = breakoff_n,
+    y = node_label,
+    fill = route_group
+  )
+) +
+  geom_col(
+    width = 0.68,
+    alpha = 0.92
+  ) +
+  geom_text(
+    aes(label = count_annotation),
+    hjust = -0.08,
+    size = 3.2,
+    colour = "#273746"
+  ) +
+  scale_fill_manual(
+    values = route_colours,
+    drop = FALSE
+  ) +
+  scale_x_continuous(
+    labels = label_comma(),
+    breaks = pretty_breaks(n = 5),
+    expand = expansion(mult = c(0, 0.28))
+  ) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title = "Highest-volume breakoff nodes",
+    subtitle = "Breakoff count and percentage of 95,034 locatable breakoffs",
+    x = "Number of breakoffs",
+    fill = NULL
+  ) +
+  common_theme
+
+# 8. Panel B: Top 10 by conditional hazard
+panel_b_hotspots <- ggplot(
+  top_hazard_nodes,
+  aes(
+    x = empirical_hazard,
+    y = node_label,
+    fill = route_group
+  )
+) +
+  geom_col(
+    width = 0.68,
+    alpha = 0.92
+  ) +
+  geom_text(
+    aes(label = hazard_annotation),
+    hjust = -0.08,
+    size = 3.15,
+    colour = "#273746"
+  ) +
+  scale_fill_manual(
+    values = route_colours,
+    drop = FALSE
+  ) +
+  scale_x_continuous(
+    labels = percent_format(accuracy = 1),
+    breaks = pretty_breaks(n = 5),
+    expand = expansion(mult = c(0, 0.42))
+  ) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title = "Highest-risk breakoff nodes",
+    subtitle = "Conditional hazard among nodes with at least 500 respondents at risk",
+    x = "Conditional breakoff hazard",
+    fill = NULL
+  ) +
+  common_theme
+
+# 9. Combine panels
+panel_a_hotspots <- panel_a_hotspots +
+  theme(legend.position = "none")
+
+panel_b_hotspots <- panel_b_hotspots +
+  guides(
+    fill = guide_legend(
+      title = NULL,
+      nrow = 1,
+      byrow = TRUE
+    )
+  ) +
+  theme(legend.position = "bottom")
+
+figure4_raw_attrition_hotspots <-
+  panel_a_hotspots /
+  panel_b_hotspots +
+  patchwork::plot_layout(
+    heights = c(1, 1)
+  ) +
+  patchwork::plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 13),
+      plot.margin = margin(8, 12, 8, 12)
+    )
+  )
+
+print(figure4_raw_attrition_hotspots)
+
+# 10. Export dissertation-quality versions
+# High-resolution PNG for Word
+ggsave(
+  filename = "figure4-raw-attrition-hotspots.png",
+  plot = figure4_raw_attrition_hotspots,
+  width = 7.2,
+  height = 8.4,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+
+
+
+# Step 6A: Fixed Setup, Metadata Integration, and Data Aggregation
+```{r}
+# Prepares the aggregated grouped-binomial dataset for question-design feature modeling
+# 1. Define statistical helper functions
+to_binary <- function(x, variable_name) {
+  x_chr <- str_to_lower(str_squish(as.character(x)))
+  result <- case_when(
+    is.na(x) ~ NA_integer_,
+    x_chr %in% c("1", "yes", "true", "y") ~ 1L,
+    x_chr %in% c("0", "no", "false", "n") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+  invalid_values <- unique(as.character(x)[!is.na(x) & is.na(result)])
+  if (length(invalid_values) > 0) {
+    stop(paste0("Unexpected values in ", variable_name, ": ", paste(invalid_values, collapse = ", ")))
+  }
+  result
+}
+
+check_model_collinearity <- function(model, model_name) {
+  if (!isTRUE(model$converged)) {
+    warning(paste(model_name, "did not converge."))
+  }
+  design_matrix <- model.matrix(model)
+  if (qr(design_matrix)$rank < ncol(design_matrix)) {
+    warning(paste(model_name, "contains perfectly collinear terms."))
+  }
+}
+
+dispersion_ratio <- function(model) {
+  sum(residuals(model, type = "pearson")^2) / df.residual(model)
+}
+
+# Extract a dispersion-adjusted nested-model F-test
+extract_f_test <- function(smaller_model,
+                           larger_model,
+                           comparison_name) {
+
+  test_output <- anova(
+    smaller_model,
+    larger_model,
+    test = "F"
+  )
+
+  result_row <- test_output[nrow(test_output), ]
+
+  tibble(
+    comparison = comparison_name,
+    df_added = result_row$Df,
+    residual_df = result_row$`Resid. Df`,
+    F_statistic = result_row$F,
+    p_value = result_row$`Pr(>F)`
+  )
+}
+
+extract_odds_ratios <- function(model, model_name) {
+  # Utilize t-distribution critical values for quasibinomial models to adjust for overdispersion
+  critical_value <- if (family(model)$family == "quasibinomial") {
+    qt(0.975, df = df.residual(model))
+  } else {
+    qnorm(0.975)
+  }
+
+  broom::tidy(model) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      Model = model_name,
+      Odds_Ratio = exp(estimate),
+      conf.low = exp(estimate - critical_value * std.error),
+      conf.high = exp(estimate + critical_value * std.error),
+      significance = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01 ~ "**",
+        p.value < 0.05 ~ "*",
+        TRUE ~ "ns"
+      )
+    ) %>%
+    select(Model, term, Odds_Ratio, conf.low, conf.high, p.value, significance)
+}
+
+print_model_summary <- function(model, model_name) {
+  cat("\nResults for:", model_name, "\n")
+  print(extract_odds_ratios(model, model_name), n = Inf, width = Inf)
+}
+
+# 2. Import and audit the refined node metadata
+metadata_path <- "Survey_Node_Metadata_refined.csv"
+node_metadata <- read_csv(metadata_path, show_col_types = FALSE)
+
+# Generate node-level prompt-length tertiles for exploratory Model 4 variations
+prompt_band_cutpoints <- quantile(
+  node_metadata$prompt_word_count,
+  probs = c(1 / 3, 2 / 3),
+  na.rm = TRUE,
+  type = 2,
+  names = FALSE
+)
+
+node_metadata <- node_metadata %>%
+  mutate(
+    prompt_wc_band_tertile = cut(
+      prompt_word_count,
+      breaks = c(-Inf, prompt_band_cutpoints[1], prompt_band_cutpoints[2], Inf),
+      labels = c("Low", "Medium", "High"),
+      include.lowest = TRUE,
+      right = TRUE
+    ),
+    prompt_wc_band_tertile = fct_relevel(factor(prompt_wc_band_tertile), "Low")
+  )
+
+# 3. Aggregate person-period observations and join metadata
+hazard_data_base <- person_period_data %>%
+  group_by(time_step, node_id) %>%
+  summarise(
+    events = sum(event, na.rm = TRUE),
+    trials = n(),
+    .groups = "drop"
+  )
+
+model_2_data <- hazard_data_base %>%
+  left_join(node_metadata, by = "node_id") %>%
+  transmute(
+    node_id,
+    events = as.numeric(events),
+    trials = as.numeric(trials),
+    time_5 = as.numeric(time_step) / 5,
+    route_simplified = fct_relevel(factor(route_simplified), "owner_main"),
+    has_text_entry = to_binary(has_text_entry, "has_text_entry"),
+    financial_sensitivity = to_binary(financial_sensitivity, "financial_sensitivity"),
+    privacy_level = factor(privacy_level, levels = c("Low", "Medium", "High")),
+    is_long_choice = to_binary(is_long_choice, "is_long_choice"),
+    prompt_wc_10 = as.numeric(as.character(prompt_wc_10)),
+    prompt_wc_band_tertile
+  )
+
+# 4. Restrict to complete cases and center the temporal baseline
+model_common_raw <- model_2_data %>%
+  drop_na(
+    node_id, events, trials, time_5, route_simplified, has_text_entry,
+    financial_sensitivity, privacy_level, is_long_choice,
+    prompt_wc_10, prompt_wc_band_tertile
+  )
+
+time_5_mean <- weighted.mean(model_common_raw$time_5, w = model_common_raw$trials, na.rm = TRUE)
+
+model_common_raw <- model_common_raw %>%
+  mutate(
+    time_5_c = time_5 - time_5_mean,
+    time_5_c_sq = time_5_c^2
+  )
+
+# 5. Build the final aggregated grouped-binomial matrix
+grouping_vars <- c(
+  "time_5_c", "time_5_c_sq", "route_simplified", "has_text_entry",
+  "financial_sensitivity", "privacy_level", "is_long_choice",
+  "prompt_wc_10", "prompt_wc_band_tertile"
+)
+
+model_compare_agg <- model_common_raw %>%
+  group_by(across(all_of(grouping_vars))) %>%
+  summarise(
+    events = sum(events, na.rm = TRUE),
+    trials = sum(trials, na.rm = TRUE),
+    non_events = trials - events,
+    .groups = "drop"
+  ) %>%
+  filter(trials > 0) %>%
+  mutate(across(where(is.factor), fct_drop))
+
+cat("Final aggregated grouped-binomial rows:", nrow(model_compare_agg), "\n")
+```
+
+
+# Step 6B: Four-Stage Nested Model Specification and Fitting
+```{r}
+# Establishes the progressive logistic regression models to evaluate overarching design mechanisms
+
+# 1. Define formulas for the four progressive models
+model_formulas <- list(
+  # Model 1: Baseline non-linear temporal fatigue
+  "Model 1" = formula(cbind(events, non_events) ~ time_5_c + time_5_c_sq),
+  
+  # Model 2: Controls for structural routing disparities
+  "Model 2" = formula(cbind(events, non_events) ~ time_5_c + time_5_c_sq + route_simplified),
+  
+  # Model 3: Core mechanism model testing UX friction and psychological resistance
+  "Model 3" = formula(cbind(events, non_events) ~ time_5_c + time_5_c_sq + route_simplified + 
+                      has_text_entry + financial_sensitivity + privacy_level),
+  
+  # Model 4: Extended burden model including scanning and reading effort
+  "Model 4" = formula(cbind(events, non_events) ~ time_5_c + time_5_c_sq + route_simplified + 
+                      has_text_entry + financial_sensitivity + privacy_level + 
+                      prompt_wc_10 + is_long_choice)
+                      
+  # NOTE: To test the categorical reading burden in Model 4, simply replace 'prompt_wc_10' 
+  # with 'prompt_wc_band_tertile' in the formula above.
+)
+
+# 2. Fit models using Quasibinomial distribution to adjust for unobserved heterogeneity (overdispersion)
+models_quasi <- map(
+  model_formulas,
+  ~ glm(
+    formula = .x,
+    family = quasibinomial(link = "logit"),
+    data = model_compare_agg
+  )
+)
+
+# 3. Execute collinearity audits
+walk2(models_quasi, names(models_quasi), check_model_collinearity)
+
+# 4. Output the definitive results for Model 3 (Core) and Model 4 (Extended)
+print_model_summary(models_quasi[["Model 3"]], "Model 3: Core Features")
+print_model_summary(models_quasi[["Model 4"]], "Model 4: Extended Burden")
+
+# 5. Evaluate Overdispersion (Unobserved Heterogeneity)
+cat("\nOverdispersion ratio for Model 4:", dispersion_ratio(models_quasi[["Model 4"]]), "\n")
+```
+
+
+# Step 6C: Model 1 & 2 Outputs, Nested ANOVA, and Fit Statistics
+```{r}
+cat("\n--- 1. Output for Model 1 (Time Baseline) and Model 2 (Route Control) ---\n")
+print_model_summary(models_quasi[["Model 1"]], "Model 1: Time Baseline")
+print_model_summary(models_quasi[["Model 2"]], "Model 2: Route Control")
+
+cat("\n--- 2. ANOVA F-Test for Nested Models ---\n")
+# Note: For Quasibinomial models, we MUST use test = "F" instead of "Chisq" 
+# because the dispersion parameter is estimated rather than fixed at 1.
+cat("\nDoes Model 4 (Extended Burden) significantly improve upon Model 3 (Core Features)?\n")
+anova_m3_m4 <- anova(models_quasi[["Model 3"]], models_quasi[["Model 4"]], test = "F")
+print(anova_m3_m4)
+
+cat("\n--- 3. Model Fit Statistics for Thesis Reporting (Model 4) ---\n")
+# Extract exact degrees of freedom and deviance statistics for your methodology/results tables
+mod4 <- models_quasi[["Model 4"]]
+
+fit_stats <- tibble(
+  Statistic = c(
+    "Aggregated Rows (Observations in GLM)",
+    "Total Analyzed Trials (Risk Set)",
+    "Total Analyzed Events (Dropouts)",
+    "Null Deviance",
+    "Null Degrees of Freedom",
+    "Residual Deviance",
+    "Residual Degrees of Freedom",
+    "Estimated Dispersion Parameter (Phi)"
+  ),
+  Value = c(
+    nobs(mod4),
+    sum(model_compare_agg$trials),
+    sum(model_compare_agg$events),
+    round(mod4$null.deviance, 2),
+    mod4$df.null,
+    round(mod4$deviance, 2),
+    mod4$df.residual,
+    round(dispersion_ratio(mod4), 3)
+  )
+)
+
+print(fit_stats, n = Inf)
+```
+
+
+## Model 4 Alternative: Categorical Reading Burden
+```{r}
+burden_data <- model_common_raw %>%
+  left_join(
+    node_metadata %>%
+      select(node_id, option_wc_10, total_visible_wc_10) %>%
+      distinct(),
+    by = "node_id"
+  ) %>%
+  mutate(
+    option_wc_10 = as.numeric(option_wc_10),
+    total_visible_wc_10 = as.numeric(total_visible_wc_10),
+    non_events = trials - events
+  ) %>%
+  drop_na(option_wc_10, total_visible_wc_10)
+
+stopifnot(
+  sum(burden_data$trials) == sum(model_common_raw$trials),
+  sum(burden_data$events) == sum(model_common_raw$events)
+)
+
+burden_base <- glm(
+  cbind(events, non_events) ~
+    time_5_c + time_5_c_sq + route_simplified +
+    has_text_entry + financial_sensitivity + privacy_level,
+  family = quasibinomial("logit"),
+  data = burden_data
+)
+
+burden_models <- list(
+  "Continuous prompt words" = update(
+    burden_base,
+    . ~ . + prompt_wc_10 + is_long_choice
+  ),
+  "Prompt-length tertiles" = update(
+    burden_base,
+    . ~ . + prompt_wc_band_tertile + is_long_choice
+  ),
+  "Total visible words" = update(
+    burden_base,
+    . ~ . + total_visible_wc_10 + is_long_choice
+  ),
+  "Prompt and option words" = update(
+    burden_base,
+    . ~ . + prompt_wc_10 + option_wc_10 + is_long_choice
+  )
+)
+
+burden_labels <- c(
+  prompt_wc_10 = "Prompt words, per 10",
+  prompt_wc_band_tertileMedium = "Medium prompt length",
+  prompt_wc_band_tertileHigh = "High prompt length",
+  total_visible_wc_10 = "Total visible words, per 10",
+  option_wc_10 = "Visible option words, per 10"
+)
+
+burden_tests <- purrr::imap_dfr(
+  burden_models,
+  function(model, model_name) {
+    test <- anova(burden_base, model, test = "F")
+    result <- test[nrow(test), ]
+
+    tibble(
+      Model = model_name,
+      df_added = result$Df,
+      residual_df = result$`Resid. Df`,
+      joint_F = result$F,
+      joint_p = result$`Pr(>F)`,
+      dispersion = dispersion_ratio(model)
+    )
+  }
+)
+
+c1_results <- purrr::imap_dfr(
+  burden_models,
+  function(model, model_name) {
+    extract_odds_ratios(model, model_name) %>%
+      filter(term %in% names(burden_labels))
+  }
+) %>%
+  mutate(Coefficient = unname(burden_labels[term])) %>%
+  left_join(burden_tests, by = "Model") %>%
+  select(
+    Model,
+    Coefficient,
+    Odds_Ratio,
+    conf.low,
+    conf.high,
+    p.value,
+    df_added,
+    residual_df,
+    joint_F,
+    joint_p,
+    dispersion
+  )
+
+print(c1_results, n = Inf, width = Inf)
+```
+
+## Appendix_Table_C1_Reading_Burden
+```{r}
+table_c1 <- c1_results %>%
+  mutate(
+    Specification = dplyr::case_when(
+  Model == "Continuous prompt words" ~ "Continuous prompt",
+  Model == "Prompt-length tertiles" ~ "Prompt tertiles",
+  Model == "Total visible words" ~ "Total visible words",
+  Model == "Prompt and option words" ~ "Decomposed words",
+  TRUE ~ Model
+),
+    `OR (95% CI)` = sprintf(
+      "%.3f (%.3f–%.3f)",
+      Odds_Ratio,
+      conf.low,
+      conf.high
+    ),
+    `Coefficient p` = format_p(p.value),
+    `Joint F (df)` = sprintf(
+      "%.2f (%d, %d)",
+      joint_F,
+      as.integer(df_added),
+      as.integer(residual_df)
+    ),
+    `Joint p` = format_p(joint_p),
+    Dispersion = sprintf("%.1f", dispersion)
+  ) %>%
+  group_by(Specification) %>%
+  mutate(
+    `Joint F (df)` = if_else(
+      row_number() == 1,
+      `Joint F (df)`,
+      ""
+    ),
+    `Joint p` = if_else(
+      row_number() == 1,
+      `Joint p`,
+      ""
+    ),
+    Dispersion = if_else(
+      row_number() == 1,
+      Dispersion,
+      ""
+    )
+  ) %>%
+  ungroup() %>%
+  select(
+    Specification,
+    Coefficient,
+    `OR (95% CI)`,
+    `Coefficient p`,
+    `Joint F (df)`,
+    `Joint p`,
+    Dispersion
+  )
+
+table_c1_ft <- flextable(table_c1) %>%
+  set_caption(
+    "Table C1. Alternative reading-burden specifications"
+  ) %>%
+  set_header_labels(
+    `OR (95% CI)` = "OR\n(95% CI)",
+    `Coefficient p` = "Coefficient\np-value",
+    `Joint F (df)` = "Joint F\n(df)",
+    `Joint p` = "Joint\np-value"
+  ) %>%
+  theme_booktabs() %>%
+  font(fontname = "Times New Roman", part = "all") %>%
+  fontsize(size = 7.5, part = "all") %>%
+  bold(part = "header") %>%
+  align(
+    j = c(
+      "OR (95% CI)",
+      "Coefficient p",
+      "Joint F (df)",
+      "Joint p",
+      "Dispersion"
+    ),
+    align = "center",
+    part = "all"
+  ) %>%
+  valign(valign = "top", part = "all") %>%
+  padding(padding = 2, part = "all") %>%
+  width(j = "Specification", width = 1.05) %>%
+  width(j = "Coefficient", width = 1.25) %>%
+  width(j = "OR (95% CI)", width = 1.25) %>%
+  width(j = "Coefficient p", width = 0.70) %>%
+  width(j = "Joint F (df)", width = 1.00) %>%
+  width(j = "Joint p", width = 0.60) %>%
+  width(j = "Dispersion", width = 0.70) %>%
+  set_table_properties(
+    layout = "fixed",
+    opts_word = list(
+      split = FALSE,
+      repeat_headers = TRUE
+    )
+  ) %>%
+  add_footer_lines(
+    paste(
+      "Notes: Odds ratios are reported with t-based 95% confidence",
+      "intervals. Low prompt length is the reference category for the",
+      "tertile specification. Each joint F-test compares the corresponding",
+      "reading-burden specification plus long-choice status with the core",
+      "Model 3 specification. A significant joint test therefore does not",
+      "imply that every individual word-count coefficient is significant.",
+      "All specifications were estimated using the same node-time dataset."
+    )
+  ) %>%
+  italic(part = "footer") %>%
+  fontsize(size = 7, part = "footer")
+
+save_as_docx(
+  table_c1_ft,
+  path = "Appendix_Table_C1_Reading_Burden.docx",
+  pr_section = prop_section(
+    page_size = page_size(orient = "portrait"),
+    page_margins = page_mar(
+      top = 0.6,
+      bottom = 0.6,
+      left = 0.6,
+      right = 0.6
+    )
+  )
+)
+```
+
+
+## Test cognitive_burden_score and topic_category
+```{r}
+# 1. Add the two metadata variables to the existing Model 4 data
+metadata_test_raw <- model_common_raw %>%
+  left_join(
+    node_metadata %>%
+      select(
+        node_id,
+        cognitive_burden_score,
+        topic_category
+      ) %>%
+      distinct(),
+    by = "node_id"
+  ) %>%
+  mutate(
+    cognitive_burden_score = factor(
+      cognitive_burden_score,
+      levels = c(1, 2, 3)
+    ),
+    topic_category = fct_relevel(
+      factor(topic_category),
+      "Other"
+    )
+  ) %>%
+  drop_na(
+    cognitive_burden_score,
+    topic_category
+  )
+
+# Check whether observations were lost
+cat(
+  "Rows before metadata addition:",
+  nrow(model_common_raw),
+  "\nRows retained:",
+  nrow(metadata_test_raw),
+  "\n"
+)
+
+# 2. Re-aggregate using the same common sample
+metadata_test_agg <- metadata_test_raw %>%
+  group_by(
+    time_5_c,
+    time_5_c_sq,
+    route_simplified,
+    has_text_entry,
+    financial_sensitivity,
+    privacy_level,
+    prompt_wc_10,
+    is_long_choice,
+    cognitive_burden_score,
+    topic_category
+  ) %>%
+  summarise(
+    events = sum(events, na.rm = TRUE),
+    trials = sum(trials, na.rm = TRUE),
+    non_events = trials - events,
+    .groups = "drop"
+  ) %>%
+  filter(trials > 0) %>%
+  mutate(
+    across(where(is.factor), fct_drop)
+  )
+
+# 3. Refit Model 4 on exactly the same metadata-complete sample
+mod4_metadata_base <- glm(
+  cbind(events, non_events) ~
+    time_5_c +
+    time_5_c_sq +
+    route_simplified +
+    has_text_entry +
+    financial_sensitivity +
+    privacy_level +
+    prompt_wc_10 +
+    is_long_choice,
+  family = quasibinomial(link = "logit"),
+  data = metadata_test_agg
+)
+
+# 4. Add cognitive burden score
+mod4_cognitive <- update(
+  mod4_metadata_base,
+  . ~ . + cognitive_burden_score
+)
+
+# 5. Add topic category
+mod4_topic <- update(
+  mod4_metadata_base,
+  . ~ . + topic_category
+)
+
+# 6. Add both variables
+mod4_cognitive_topic <- update(
+  mod4_metadata_base,
+  . ~ . + cognitive_burden_score + topic_category
+)
+
+# 7. Check convergence and perfect collinearity
+check_model_collinearity(
+  mod4_cognitive,
+  "Model 4 + cognitive burden"
+)
+
+check_model_collinearity(
+  mod4_topic,
+  "Model 4 + topic category"
+)
+
+check_model_collinearity(
+  mod4_cognitive_topic,
+  "Model 4 + cognitive burden + topic"
+)
+
+# 8. Overall F-tests
+cat("\n--- Cognitive burden added to Model 4 ---\n")
+print(
+  anova(
+    mod4_metadata_base,
+    mod4_cognitive,
+    test = "F"
+  )
+)
+
+cat("\n--- Topic category added to Model 4 ---\n")
+print(
+  anova(
+    mod4_metadata_base,
+    mod4_topic,
+    test = "F"
+  )
+)
+
+cat("\n--- Cognitive burden after controlling for topic ---\n")
+print(
+  anova(
+    mod4_topic,
+    mod4_cognitive_topic,
+    test = "F"
+  )
+)
+
+cat("\n--- Topic category after controlling for cognitive burden ---\n")
+print(
+  anova(
+    mod4_cognitive,
+    mod4_cognitive_topic,
+    test = "F"
+  )
+)
+
+# 9. Display only the new coefficients as ORs
+cognitive_results <- extract_odds_ratios(
+  mod4_cognitive,
+  "Model 4 + cognitive burden"
+) %>%
+  filter(str_detect(term, "^cognitive_burden_score"))
+
+topic_results <- extract_odds_ratios(
+  mod4_topic,
+  "Model 4 + topic category"
+) %>%
+  filter(str_detect(term, "^topic_category"))
+
+combined_results <- extract_odds_ratios(
+  mod4_cognitive_topic,
+  "Model 4 + both"
+) %>%
+  filter(
+    str_detect(
+      term,
+      "^cognitive_burden_score|^topic_category"
+    )
+  )
+
+bind_rows(
+  cognitive_results,
+  topic_results,
+  combined_results
+) %>%
+  print(n = Inf, width = Inf)
+
+# 10. Dispersion ratios
+cat(
+  "\nModel 4 dispersion:",
+  round(dispersion_ratio(mod4_metadata_base), 3),
+  "\nCognitive model dispersion:",
+  round(dispersion_ratio(mod4_cognitive), 3),
+  "\nTopic model dispersion:",
+  round(dispersion_ratio(mod4_topic), 3),
+  "\nCombined model dispersion:",
+  round(dispersion_ratio(mod4_cognitive_topic), 3),
+  "\n"
+)
+```
+
+
+## c3_cognitive_coefficients
+```{r}
+c3_tests <- bind_rows(
+  extract_f_test(
+    mod4_metadata_base,
+    mod4_cognitive,
+    "Cognitive burden added to Model 4"
+  ) %>%
+    mutate(dispersion = dispersion_ratio(mod4_cognitive)),
+
+  extract_f_test(
+    mod4_metadata_base,
+    mod4_topic,
+    "Topic category added to Model 4"
+  ) %>%
+    mutate(dispersion = dispersion_ratio(mod4_topic)),
+
+  extract_f_test(
+    mod4_topic,
+    mod4_cognitive_topic,
+    "Cognitive burden after topic"
+  ) %>%
+    mutate(dispersion = dispersion_ratio(mod4_cognitive_topic)),
+
+  extract_f_test(
+    mod4_cognitive,
+    mod4_cognitive_topic,
+    "Topic category after cognitive burden"
+  ) %>%
+    mutate(dispersion = dispersion_ratio(mod4_cognitive_topic))
+)
+
+c3_cognitive_coefficients <- extract_odds_ratios(
+  mod4_cognitive_topic,
+  "Model 4 + cognitive burden + topic"
+) %>%
+  filter(str_detect(term, "^cognitive_burden_score")) %>%
+  select(
+    term,
+    Odds_Ratio,
+    conf.low,
+    conf.high,
+    p.value
+  )
+
+print(c3_tests, n = Inf, width = Inf)
+print(c3_cognitive_coefficients, n = Inf, width = Inf)
+```
+
+
+## Appendix_Table_C3_Cognitive_Topic_Extensions
+```{r}
+table_c3 <- c3_tests %>%
+  slice_head(n = 4) %>%
+  transmute(
+    Comparison = comparison,
+    `df added` = as.integer(df_added),
+    `Residual df` = as.integer(residual_df),
+    `F statistic` = sprintf("%.2f", F_statistic),
+    `p-value` = format_p(p_value),
+    Dispersion = sprintf("%.1f", dispersion)
+  )
+
+table_c3_ft <- flextable(table_c3) %>%
+  set_caption(
+    "Table C3. Joint tests of cognitive-burden and topic-category extensions"
+  ) %>%
+  theme_booktabs() %>%
+  font(fontname = "Times New Roman", part = "all") %>%
+  fontsize(size = 8.5, part = "all") %>%
+  bold(part = "header") %>%
+  align(
+    j = c(
+      "df added",
+      "Residual df",
+      "F statistic",
+      "p-value",
+      "Dispersion"
+    ),
+    align = "center",
+    part = "all"
+  ) %>%
+  valign(valign = "center", part = "all") %>%
+  width(j = "Comparison", width = 3.4) %>%
+  width(j = "df added", width = 0.65) %>%
+  width(j = "Residual df", width = 0.75) %>%
+  width(j = "F statistic", width = 0.75) %>%
+  width(j = "p-value", width = 0.65) %>%
+  width(j = "Dispersion", width = 0.75) %>%
+  set_table_properties(
+    layout = "fixed",
+    width = 1,
+    opts_word = list(
+      split = FALSE,
+      repeat_headers = TRUE
+    )
+  ) %>%
+  add_footer_lines(
+    paste(
+      "Notes: Each row reports a nested F-test comparing the indicated",
+      "extended quasibinomial model with its reduced counterpart. Dispersion",
+      "refers to the larger model. Individual cognitive-burden contrasts are",
+      "not reported because the highest-burden category produced an unstable",
+      "coefficient with an unbounded confidence interval. These block tests",
+      "are interpreted as exploratory tests of joint contribution rather than",
+      "evidence of specific category-level effects."
+    )
+  ) %>%
+  italic(part = "footer") %>%
+  fontsize(size = 7.5, part = "footer")
+
+save_as_docx(
+  table_c3_ft,
+  path = "Appendix_Table_C3_Cognitive_Topic_Extensions.docx",
+  pr_section = prop_section(
+    page_size = page_size(orient = "portrait"),
+    page_margins = page_mar(
+      top = 0.6,
+      bottom = 0.6,
+      left = 0.6,
+      right = 0.6
+    )
+  )
+)
+```
+
+
+```{r}
+# 1. Extract ORs and t-based 95% CIs from quasibinomial models
+extract_quasi_results <- function(model, model_name) {
+
+  coef_table <- as.data.frame(
+    summary(model)$coefficients
+  )
+
+  critical_value <- qt(
+    0.975,
+    df = df.residual(model)
+  )
+
+  tibble(
+    model = model_name,
+    term = rownames(coef_table),
+    estimate = coef_table[, "Estimate"],
+    std_error = coef_table[, "Std. Error"],
+    p_value = coef_table[, ncol(coef_table)]
+  ) %>%
+    mutate(
+      conf_low_log =
+        estimate - critical_value * std_error,
+      conf_high_log =
+        estimate + critical_value * std_error,
+
+      odds_ratio = exp(estimate),
+      conf_low = exp(conf_low_log),
+      conf_high = exp(conf_high_log),
+
+      significance = case_when(
+        p_value < 0.001 ~ "***",
+        p_value < 0.01  ~ "**",
+        p_value < 0.05  ~ "*",
+        TRUE            ~ ""
+      ),
+
+      estimate_ci = paste0(
+        sprintf("%.3f", odds_ratio),
+        " [",
+        sprintf("%.3f", conf_low),
+        ", ",
+        sprintf("%.3f", conf_high),
+        "]",
+        significance
+      )
+    )
+}
+
+# Only the four primary models
+main_models <- models_quasi[
+  c("Model 1", "Model 2", "Model 3", "Model 4")
+]
+
+table3_long <- purrr::imap_dfr(
+  main_models,
+  ~ extract_quasi_results(.x, .y)
+)
+
+# 2. Reader-friendly variable labels
+
+term_labels <- c(
+  "time_5_c" =
+    "Operational time (centred 5-node units)",
+
+  "time_5_c_sq" =
+    "Operational time squared",
+
+  "route_simplifiedrepeated_dogs_loop" =
+    "Repeated-dog loop",
+
+  "route_simplifiednon_owner_exit" =
+    "Non-owner route",
+
+  "has_text_entry" =
+    "Text entry required",
+
+  "financial_sensitivity" =
+    "Financially sensitive content",
+
+  "privacy_levelMedium" =
+    "Privacy level: Medium",
+
+  "privacy_levelHigh" =
+    "Privacy level: High",
+
+  "prompt_wc_10" =
+    "Prompt length (per 10 additional words)",
+
+  "is_long_choice" =
+    "Long choice set"
+)
+
+term_order <- names(term_labels)
+
+# 3. Convert to the wide Table 3 format
+table3_display <- table3_long %>%
+  filter(term %in% term_order) %>%
+  mutate(
+    predictor = unname(term_labels[term]),
+    row_order = match(term, term_order),
+    model = factor(
+      model,
+      levels = c(
+        "Model 1",
+        "Model 2",
+        "Model 3",
+        "Model 4"
+      )
+    )
+  ) %>%
+  arrange(row_order, model) %>%
+  select(
+    row_order,
+    Predictor = predictor,
+    model,
+    estimate_ci
+  ) %>%
+  pivot_wider(
+    names_from = model,
+    values_from = estimate_ci,
+    values_fill = "\u2014"
+  ) %>%
+  arrange(row_order) %>%
+  select(-row_order)
+
+print(table3_display)
+```
+
+## table 3
+```{r}
+table3_ft <- flextable(table3_display) %>%
+  set_caption(
+    caption = paste0(
+      "Table 3. Progressive quasibinomial discrete-time ",
+      "hazard models of questionnaire breakoff"
+    )
+  ) %>%
+  theme_booktabs() %>%
+  align(
+    j = 1,
+    align = "left",
+    part = "all"
+  ) %>%
+  align(
+    j = 2:5,
+    align = "center",
+    part = "all"
+  ) %>%
+  width(j = 1, width = 2.1) %>%
+  width(j = 2:5, width = 1.05) %>%
+  fontsize(size = 9.5, part = "body") %>%
+  fontsize(size = 9.5, part = "header") %>%
+  add_footer_lines(
+    values = c(
+      paste0(
+        "Notes: Cells report odds ratios with t-based 95% ",
+        "confidence intervals in brackets."
+      ),
+      paste0(
+        "Reference categories: owner main route; low privacy; ",
+        "no text entry; no financial sensitivity; and no long ",
+        "choice set. Prompt length is measured per 10 additional words."
+      ),
+      "* p < .05; ** p < .01; *** p < .001."
+    )
+  ) %>%
+  fontsize(size = 8, part = "footer") %>%
+  italic(part = "footer") %>%
+  set_table_properties(
+    layout = "fixed",
+    width = 1
+  )
+
+table3_ft
+
+flextable::save_as_docx(
+  table3_ft,
+  path = "Table_3_Models_1_to_4.docx"
+)
+
+write.csv(
+  table3_long,
+  "Table_3_Full_Numerical_Results.csv",
+  row.names = FALSE
+)
+```
+
+
+
+## sequential F-tests
+```{r}
+# Confirm all models use the same analytical rows
+stopifnot(
+  length(unique(
+    purrr::map_dbl(main_models, nobs)
+  )) == 1
+)
+
+nested_f_tests <- bind_rows(
+  extract_f_test(
+    main_models[["Model 1"]],
+    main_models[["Model 2"]],
+    "Model 1 vs Model 2"
+  ),
+  extract_f_test(
+    main_models[["Model 2"]],
+    main_models[["Model 3"]],
+    "Model 2 vs Model 3"
+  ),
+  extract_f_test(
+    main_models[["Model 3"]],
+    main_models[["Model 4"]],
+    "Model 3 vs Model 4"
+  )
+)
+
+print(nested_f_tests, n = Inf)
+```
+
+
+
+## figure 5
+```{r}
+# Figure 5: Adjusted ORs from final Model 4
+
+figure5_terms <- c(
+  "route_simplifiedrepeated_dogs_loop",
+  "route_simplifiednon_owner_exit",
+  "has_text_entry",
+  "financial_sensitivity",
+  "privacy_levelMedium",
+  "privacy_levelHigh",
+  "prompt_wc_10",
+  "is_long_choice"
+)
+
+figure5_data <- extract_quasi_results(
+  main_models[["Model 4"]],
+  "Model 4"
+) %>%
+  filter(term %in% figure5_terms) %>%
+  mutate(
+    predictor = unname(term_labels[term]),
+
+    # Determines the top-to-bottom order
+    predictor = factor(
+      predictor,
+      levels = rev(
+        unname(term_labels[figure5_terms])
+      )
+    )
+  )
+
+figure5_model4_adjusted_odds_ratios <- ggplot(
+  figure5_data,
+  aes(
+    x = odds_ratio,
+    y = predictor
+  )
+) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    linewidth = 0.6,
+    colour = "#7F8C8D"
+  ) +
+  geom_segment(
+    aes(
+      x = conf_low,
+      xend = conf_high,
+      y = predictor,
+      yend = predictor
+    ),
+    linewidth = 0.8,
+    colour = "#2C7FB8"
+  ) +
+  geom_point(
+    size = 3,
+    shape = 21,
+    fill = "#2C7FB8",
+    colour = "white",
+    stroke = 0.6
+  ) +
+  scale_x_log10(
+    breaks = scales::log_breaks(n = 6),
+    labels = scales::label_number(accuracy = 0.01)
+  ) +
+  labs(
+    x = "Adjusted odds ratio (log scale)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11.5) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(colour = "#273746"),
+    axis.text.y = element_text(size = 10),
+    axis.title.x = element_text(
+      margin = margin(t = 8)
+    ),
+    plot.margin = margin(
+      t = 10,
+      r = 15,
+      b = 10,
+      l = 10
+    )
+  )
+
+print(figure5_model4_adjusted_odds_ratios)
+
+ggsave(
+  "figure5-model4-adjusted-odds-ratios.png",
+  figure5_model4_adjusted_odds_ratios,
+  width = 7.2,
+  height = 4.8,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+
+# Step 7: Route-Specific Heterogeneity and Descriptive Summary
+```{r}
+# Identify all nodes occurring before or at the route-defining question
+q1_order <- node_order_tbl %>%
+  filter(node_id == "Q1_DogNumber") %>%
+  pull(node_order)
+
+stopifnot(length(q1_order) == 1)
+
+pre_route_nodes <- node_order_tbl %>%
+  filter(node_order <= q1_order) %>%
+  pull(node_id)
+
+# Route-specific modelling dataset:
+# retain only nodes occurring after route entry
+route_model_raw <- model_common_raw %>%
+  filter(
+    !node_id %in% pre_route_nodes,
+    route_simplified %in%
+      c(
+        "owner_main",
+        "repeated_dogs_loop",
+        "non_owner_exit"
+      )
+  )
+```
+
+
+
+## Owner route model
+```{r}
+owner_route_data <- route_model_raw %>%
+  filter(
+    route_simplified %in%
+      c("owner_main", "repeated_dogs_loop")
+  ) %>%
+  group_by(
+    time_5_c,
+    time_5_c_sq,
+    route_simplified,
+    has_text_entry,
+    financial_sensitivity,
+    privacy_level,
+    is_long_choice,
+    prompt_wc_10
+  ) %>%
+  summarise(
+    events = sum(events, na.rm = TRUE),
+    trials = sum(trials, na.rm = TRUE),
+    non_events = trials - events,
+    .groups = "drop"
+  ) %>%
+  filter(trials > 0) %>%
+  mutate(
+    route_simplified = fct_relevel(
+      factor(route_simplified),
+      "owner_main"
+    )
+  )
+
+model_owner_route <- glm(
+  cbind(events, non_events) ~
+    time_5_c +
+    time_5_c_sq +
+    route_simplified +
+    has_text_entry +
+    financial_sensitivity +
+    privacy_level +
+    is_long_choice +
+    prompt_wc_10,
+  family = quasibinomial("logit"),
+  data = owner_route_data
+)
+```
+
+
+## non-owner route model
+```{r}
+non_owner_route_data <- route_model_raw %>%
+  filter(route_simplified == "non_owner_exit") %>%
+  mutate(
+    privacy_high =
+      as.integer(privacy_level == "High")
+  ) %>%
+  group_by(
+    time_5_c,
+    time_5_c_sq,
+    has_text_entry,
+    financial_sensitivity,
+    privacy_high,
+    is_long_choice,
+    prompt_wc_10
+  ) %>%
+  summarise(
+    events = sum(events, na.rm = TRUE),
+    trials = sum(trials, na.rm = TRUE),
+    non_events = trials - events,
+    .groups = "drop"
+  ) %>%
+  filter(trials > 0)
+
+model_non_owner_route_final <- glm(
+  cbind(events, non_events) ~
+    time_5_c +
+    time_5_c_sq +
+    has_text_entry +
+    financial_sensitivity +
+    privacy_high +
+    is_long_choice +
+    prompt_wc_10,
+  family = quasibinomial("logit"),
+  data = non_owner_route_data
+)
+```
+
+
+
+## table 5
+```{r}
+# Extract every coefficient from each route-specific model
+extract_all_route_terms <- function(model, route_code) {
+
+  critical_value <- qt(
+    0.975,
+    df = df.residual(model)
+  )
+
+  broom::tidy(model) %>%
+    mutate(
+      route = route_code,
+
+      OR = exp(estimate),
+
+      CI_low = exp(
+        estimate -
+          critical_value * std.error
+      ),
+
+      CI_high = exp(
+        estimate +
+          critical_value * std.error
+      ),
+
+      stars = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE            ~ ""
+      ),
+
+      row_key = case_when(
+        term == "(Intercept)" ~
+          "intercept",
+
+        term == "time_5_c" ~
+          "time_linear",
+
+        term == "time_5_c_sq" ~
+          "time_quadratic",
+
+        term ==
+          "route_simplifiedrepeated_dogs_loop" ~
+          "repeated_loop",
+
+        term == "has_text_entry" ~
+          "text_entry",
+
+        term == "financial_sensitivity" ~
+          "financial",
+
+        route_code == "owner" &
+          term == "privacy_levelMedium" ~
+          "privacy_medium_low",
+
+        route_code == "owner" &
+          term == "privacy_levelHigh" ~
+          "privacy_high_low",
+
+        route_code == "non_owner" &
+          term == "privacy_high" ~
+          "privacy_high_lowmedium",
+
+        term == "is_long_choice" ~
+          "long_choice",
+
+        term == "prompt_wc_10" ~
+          "prompt_length",
+
+        TRUE ~ NA_character_
+      ),
+
+      estimate_cell = sprintf(
+  "%.3f [%.3f, %.3f]%s",
+  OR,
+  CI_low,
+  CI_high,
+  stars)
+    )
+}
+
+# Combine the two final route-specific models
+# and remove the intercept
+route_terms_all <- bind_rows(
+  extract_all_route_terms(
+    model_owner_route,
+    "owner"
+  ),
+  extract_all_route_terms(
+    model_non_owner_route_final,
+    "non_owner"
+  )
+) %>%
+  filter(term != "(Intercept)")
+
+# Check that all retained terms have been labelled
+stopifnot(
+  !any(is.na(route_terms_all$row_key))
+)
+
+# Row order and labels consistent with Table 5
+route_row_specification <- tribble(
+  ~row_order, ~row_key, ~Variable,
+
+  1,
+  "time_linear",
+  "Operational time (centred 5-node units)",
+
+  2,
+  "time_quadratic",
+  "Operational time squared",
+
+  3,
+  "repeated_loop",
+  "Repeated-dog loop",
+
+  4,
+  "text_entry",
+  "Text entry required",
+
+  5,
+  "financial",
+  "Financially sensitive content",
+
+  6,
+  "privacy_medium_low",
+  "Privacy level: Medium",
+
+  7,
+  "privacy_high_low",
+  "Privacy level: High (ref: Low)",
+
+  8,
+  "privacy_high_lowmedium",
+  "Privacy level: High (ref: Low/Medium)",
+
+  9,
+  "prompt_length",
+  "Prompt length (per 10 additional words)",
+
+  10,
+  "long_choice",
+  "Long choice set"
+)
+
+# Construct the coefficient section
+route_table_full <- route_terms_all %>%
+  select(
+    row_key,
+    route,
+    estimate_cell
+  ) %>%
+  pivot_wider(
+    names_from = route,
+    values_from = estimate_cell
+  ) %>%
+  right_join(
+    route_row_specification,
+    by = "row_key"
+  ) %>%
+  arrange(row_order) %>%
+  transmute(
+    Variable,
+
+    # Use an em dash when a term was not estimated
+    owner = replace_na(owner, "—"),
+    non_owner = replace_na(non_owner, "—")
+  )
+
+# Add model sample information
+# Dispersion ratio is deliberately excluded
+route_table_full <- bind_rows(
+  route_table_full,
+
+  tibble(
+    Variable = c(
+      "Respondent-node exposures",
+      "Breakoff events"
+    ),
+
+    owner = c(
+      format(
+        sum(owner_route_data$trials),
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+
+      format(
+        sum(owner_route_data$events),
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      )
+    ),
+
+    non_owner = c(
+      format(
+        sum(non_owner_route_data$trials),
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+
+      format(
+        sum(non_owner_route_data$events),
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      )
+    )
+  )
+)
+
+# Format Table 5
+Table_5_full <- flextable(
+  route_table_full
+) %>%
+  set_header_labels(
+    Variable = "Variable",
+    owner = "Dog-owner route",
+    non_owner = "Non-owner route"
+  ) %>%
+  set_caption(
+    caption = paste(
+      "Table 5. Route-specific quasibinomial",
+      "discrete-time hazard models of questionnaire breakoff"
+    )
+  ) %>%
+  theme_booktabs() %>%
+  bold(part = "header") %>%
+  align(
+    j = 2:3,
+    align = "center",
+    part = "all"
+  ) %>%
+  valign(
+    valign = "center",
+    part = "all"
+  ) %>%
+  autofit() %>%
+  add_footer_lines(
+    values = c(
+      paste(
+        "Notes: Cells report adjusted odds ratios with",
+        "t-based 95% confidence intervals."
+      ),
+      paste(
+        "Em dashes indicate that the term was not estimated",
+        "in the corresponding route-specific model."
+      ),
+      paste(
+        "The dog-owner model used owner-main as the route",
+        "reference and Low as the privacy reference category."
+      ),
+      paste(
+        "The non-owner privacy coefficient compares High",
+        "with the combined Low/Medium category."
+      ),
+      paste(
+        "The non-owner high-privacy estimate is primarily",
+        "supported by the postcode node and should be",
+        "interpreted cautiously."
+      ),
+      "* p < .05, ** p < .01, *** p < .001."
+    )
+  ) %>%
+  fontsize(
+    size = 9,
+    part = "footer"
+  )
+
+Table_5_full
+
+save_as_docx(
+  Table_5_full,
+  path =
+    "Table_5_Route_Specific_Adjusted_Associations_Full.docx"
+)
+```
+
+
+
+## route traffic
+```{r}
+respondent_route_status <- raw_data %>%
+  transmute(
+    ResponseId,
+    Finished,
+    route_group = case_when(
+      Q1_DogNumber == "I don't have a dog" ~
+        "Non-Owner Route",
+
+      Q1_DogNumber %in%
+        c(
+          "One",
+          "Two",
+          "Three",
+          "Four",
+          "Five or more (please specify)"
+        ) ~
+        "Dog Owner Route",
+
+      TRUE ~ "Pre-route or undetermined"
+    )
+  )
+
+route_traffic <- respondent_route_status %>%
+  filter(
+    route_group %in%
+      c("Dog Owner Route", "Non-Owner Route")
+  ) %>%
+  group_by(route_group) %>%
+  summarise(
+    Total_Entrants = n(),
+    Total_Dropouts =
+      sum(Finished == FALSE, na.rm = TRUE),
+    Dropout_Rate_Pct =
+      100 * Total_Dropouts / Total_Entrants,
+    .groups = "drop"
+  )
+
+print(route_traffic)
+```
+
+
+
+## graph
+```{r}
+# One unique metadata record per node
+route_lookup <- node_metadata %>%
+  select(
+    node_id,
+    route_simplified,
+    topic_category
+  ) %>%
+  distinct()
+
+stopifnot(
+  anyDuplicated(route_lookup$node_id) == 0
+)
+
+# Attach the route indicated by each post-Q1 node
+person_period_with_route <- person_period_data %>%
+  left_join(
+    route_lookup,
+    by = "node_id"
+  ) %>%
+  filter(
+    !node_id %in% pre_route_nodes
+  ) %>%
+  mutate(
+    route_group = case_when(
+      route_simplified ==
+        "non_owner_exit" ~
+        "Non-Owner Route",
+
+      route_simplified %in%
+        c(
+          "owner_main",
+          "repeated_dogs_loop"
+        ) ~
+        "Dog Owner Route",
+
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(route_group))
+
+# Node-level empirical risk and dropout concentration
+route_node_risk <- person_period_with_route %>%
+  group_by(
+    route_group,
+    node_id,
+    topic_category
+  ) %>%
+  summarise(
+    at_risk_n =
+      n_distinct(ResponseId),
+
+    dropouts =
+      sum(event, na.rm = TRUE),
+
+    empirical_hazard =
+      dropouts / at_risk_n,
+
+    .groups = "drop"
+  ) %>%
+  group_by(route_group) %>%
+  arrange(
+    desc(dropouts),
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    volume_rank = row_number(),
+
+    dropout_share_within_route =
+      dropouts / sum(dropouts),
+
+    cumulative_dropout_share =
+      cumsum(
+        dropout_share_within_route
+      )
+  ) %>%
+  ungroup()
+
+# Top five nodes within each route
+route_hotspot_top5 <- route_node_risk %>%
+  filter(volume_rank <= 5) %>%
+  transmute(
+    Route = route_group,
+    Rank = volume_rank,
+    Node = node_id,
+    Topic = topic_category,
+    `At risk` = at_risk_n,
+    Dropouts = dropouts,
+
+    `Empirical hazard (%)` =
+      round(empirical_hazard * 100, 2),
+
+    `Share of route dropouts (%)` =
+      round(
+        dropout_share_within_route * 100,
+        2
+      ),
+
+    `Cumulative share (%)` =
+      round(
+        cumulative_dropout_share * 100,
+        2
+      )
+  )
+
+print(
+  route_hotspot_top5,
+  n = Inf,
+  width = Inf
+)
+```
+
+
+
+## Table 4: top10 table
+```{r}
+# Reader-facing descriptions for the ten hotspot nodes
+hotspot_question_lookup <- tribble(
+  ~Node, ~Question,
+
+  "Q1.2_DogName",
+  "Dog's name",
+
+  "Q17.1_ServicesCutCoL",
+  "Services cut due to cost of living",
+
+  "Q13.2_HolidayAccommo",
+  "Preferred holiday accommodation",
+
+  "Q29_Postcode",
+  "First part of postcode",
+
+  "Q22_ImproveLife",
+  "One thing that would improve life with the dog",
+
+  "E2FutureDogOwner",
+  "Hope to own a dog in the future",
+
+  "E3_FutureDogSource",
+  "Likely future sources for obtaining a dog",
+
+  "E13_Postcode",
+  "First part of postcode",
+
+  "E8_GovRole",
+  "Government role in dog welfare",
+
+  "E3.1_NotRescue",
+  "Reasons for not considering a rescue dog"
+)
+
+# Add readable question descriptions and format values
+hotspot_table_base <- route_hotspot_top5 %>%
+  left_join(
+    hotspot_question_lookup,
+    by = "Node"
+  )
+
+# Ensure that every Top-5 node has a description
+stopifnot(
+  !any(is.na(hotspot_table_base$Question))
+)
+
+hotspot_table_base <- hotspot_table_base %>%
+  transmute(
+    Route,
+
+    Rank = as.character(Rank),
+
+    `Node / question` =
+      paste0(
+        Node,
+        " — ",
+        Question
+      ),
+
+    `At risk` =
+      format(
+        `At risk`,
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+
+    Breakoffs =
+      format(
+        Dropouts,
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+
+    `Hazard (%)` =
+      sprintf(
+        "%.2f",
+        `Empirical hazard (%)`
+      ),
+
+    `Route share (%)` =
+      sprintf(
+        "%.2f",
+        `Share of route dropouts (%)`
+      ),
+
+    `Cumulative share (%)` =
+      sprintf(
+        "%.2f",
+        `Cumulative share (%)`
+      )
+  )
+
+# Check the route labels produced in the previous step
+stopifnot(
+  all(
+    c(
+      "Dog Owner Route",
+      "Non-Owner Route"
+    ) %in% unique(hotspot_table_base$Route)
+  )
+)
+
+# Separate the two routes
+owner_hotspots <- hotspot_table_base %>%
+  filter(Route == "Dog Owner Route") %>%
+  select(-Route)
+
+non_owner_hotspots <- hotspot_table_base %>%
+  filter(Route == "Non-Owner Route") %>%
+  select(-Route)
+
+# Create a panel-heading row
+make_panel_row <- function(label) {
+  tibble(
+    Rank = label,
+    `Node / question` = label,
+    `At risk` = label,
+    Breakoffs = label,
+    `Hazard (%)` = label,
+    `Route share (%)` = label,
+    `Cumulative share (%)` = label
+  )
+}
+
+# Combine the two panels into one table
+table_4_data <- bind_rows(
+  make_panel_row(
+    "Panel A: Dog-owner route"
+  ),
+  owner_hotspots,
+
+  make_panel_row(
+    "Panel B: Non-owner route"
+  ),
+  non_owner_hotspots
+)
+
+# Positions of the two panel rows
+panel_rows <- c(
+  1,
+  nrow(owner_hotspots) + 2
+)
+
+# Produce the final flextable
+table_4_hotspots <- flextable(
+  table_4_data
+) %>%
+  set_caption(
+    caption = paste(
+      "Table 4. Top five post-route breakoff",
+      "hotspots by breakoff volume"
+    )
+  ) %>%
+  theme_booktabs() %>%
+
+  # Merge the cells across each panel heading
+  merge_h(
+    i = panel_rows,
+    part = "body"
+  ) %>%
+
+  bold(
+    i = panel_rows,
+    part = "body"
+  ) %>%
+
+  bg(
+    i = panel_rows,
+    bg = "#EAF2F8",
+    part = "body"
+  ) %>%
+
+  align(
+    i = panel_rows,
+    align = "left",
+    part = "body"
+  ) %>%
+
+  bold(part = "header") %>%
+
+  align(
+    j = c(
+      "Rank",
+      "At risk",
+      "Breakoffs",
+      "Hazard (%)",
+      "Route share (%)",
+      "Cumulative share (%)"
+    ),
+    align = "center",
+    part = "all"
+  ) %>%
+
+  valign(
+    valign = "center",
+    part = "all"
+  ) %>%
+
+  fontsize(
+    size = 9,
+    part = "all"
+  ) %>%
+
+  set_table_properties(
+    layout = "fixed",
+    width = 1
+  ) %>%
+
+  width(
+    j = "Rank",
+    width = 0.45
+  ) %>%
+
+  width(
+    j = "Node / question",
+    width = 2.35
+  ) %>%
+
+  width(
+    j = "At risk",
+    width = 0.75
+  ) %>%
+
+  width(
+    j = "Breakoffs",
+    width = 0.68
+  ) %>%
+
+  width(
+    j = "Hazard (%)",
+    width = 0.62
+  ) %>%
+
+  width(
+    j = "Route share (%)",
+    width = 0.72
+  ) %>%
+
+  width(
+    j = "Cumulative share (%)",
+    width = 0.78
+  ) %>%
+
+  add_footer_lines(
+    values = paste(
+      "Notes: Nodes were ranked by breakoff count rather",
+      "than empirical hazard. At-risk counts represent",
+      "respondents reaching each node. Route shares were",
+      "calculated among locatable post-route breakoff events."
+    )
+  )
+
+table_4_hotspots
+
+save_as_docx(
+  table_4_hotspots,
+  path =
+    "Table_4_Route_Specific_Top_5_Hotspots.docx"
+)
+```
+
+
+
+## interaction test
+```{r}
+route_interaction_data <- route_model_raw %>%
+  mutate(
+    route_group = factor(
+      if_else(
+        route_simplified == "non_owner_exit",
+        "Non-owner",
+        "Owner"
+      ),
+      levels = c("Owner", "Non-owner")
+    ),
+    repeated_dog_loop =
+      as.integer(
+        route_simplified ==
+          "repeated_dogs_loop"
+      ),
+    privacy_high =
+      as.integer(privacy_level == "High")
+  ) %>%
+  group_by(
+    time_5_c,
+    time_5_c_sq,
+    route_group,
+    repeated_dog_loop,
+    has_text_entry,
+    financial_sensitivity,
+    privacy_high,
+    is_long_choice,
+    prompt_wc_10
+  ) %>%
+  summarise(
+    events = sum(events),
+    trials = sum(trials),
+    non_events = trials - events,
+    .groups = "drop"
+  ) %>%
+  filter(trials > 0)
+
+route_interaction_null <- glm(
+  cbind(events, non_events) ~
+    route_group * time_5_c +
+    route_group * time_5_c_sq +
+    repeated_dog_loop +
+    has_text_entry +
+    financial_sensitivity +
+    privacy_high +
+    is_long_choice +
+    prompt_wc_10,
+  family = quasibinomial("logit"),
+  data = route_interaction_data
+)
+
+route_interaction_full <- update(
+  route_interaction_null,
+  . ~ . +
+    route_group:financial_sensitivity +
+    route_group:privacy_high +
+    route_group:is_long_choice
+)
+
+route_interaction_joint_test <- anova(
+  route_interaction_null,
+  route_interaction_full,
+  test = "F"
+)
+
+print(route_interaction_joint_test)
+```
+
+
+## C2_route_interaction_joint_test
+```{r}
+c2_results <- extract_odds_ratios(
+  route_interaction_full,
+  "Pooled route-interaction model"
+) %>%
+  filter(
+    str_detect(term, "route_groupNon-owner") &
+      str_detect(
+        term,
+        "financial_sensitivity|privacy_high|is_long_choice"
+      )
+  ) %>%
+  mutate(
+    Interaction = case_when(
+      str_detect(term, "financial_sensitivity") ~
+        "Non-owner route × financial sensitivity",
+      str_detect(term, "privacy_high") ~
+        "Non-owner route × high privacy",
+      str_detect(term, "is_long_choice") ~
+        "Non-owner route × long choice set"
+    )
+  ) %>%
+  select(
+    Interaction,
+    Odds_Ratio,
+    conf.low,
+    conf.high,
+    p.value
+  )
+
+print(c2_results, n = Inf, width = Inf)
+print(route_interaction_joint_test)
+```
+
+
+## Appendix_Table_C2_Route_Interactions
+```{r}
+joint_result <- route_interaction_joint_test[2, ]
+
+table_c2 <- c2_results %>%
+  transmute(
+    Interaction,
+    `Ratio of ORs (95% CI)` = sprintf(
+      "%.3f (%.3f–%.3f)",
+      Odds_Ratio,
+      conf.low,
+      conf.high
+    ),
+    `p-value` = format_p(p.value)
+  )
+
+c2_note <- paste0(
+  "Notes: Entries are interaction ratios of odds ratios from the pooled ",
+  "quasibinomial model, with the dog-owner route as the reference. ",
+  "Values below 1 indicate that the corresponding association was smaller ",
+  "on the non-owner route. The joint test of all three interactions was ",
+  "F(",
+  joint_result$Df,
+  ", ",
+  joint_result$`Resid. Df`,
+  ") = ",
+  sprintf("%.3f", joint_result$F),
+  ", p = ",
+  format_p(joint_result$`Pr(>F)`),
+  ". Confidence intervals are t-based."
+)
+
+table_c2_ft <- flextable(table_c2) %>%
+  set_caption(
+    caption = "Table C2. Pooled route-interaction tests"
+  ) %>%
+  theme_booktabs() %>%
+  font(
+    fontname = "Times New Roman",
+    part = "all"
+  ) %>%
+  fontsize(
+    size = 8.5,
+    part = "all"
+  ) %>%
+  bold(part = "header") %>%
+  align(
+    j = c(
+      "Ratio of ORs (95% CI)",
+      "p-value"
+    ),
+    align = "center",
+    part = "all"
+  ) %>%
+  valign(
+    valign = "center",
+    part = "all"
+  ) %>%
+  width(
+    j = "Interaction",
+    width = 3.5
+  ) %>%
+  width(
+    j = "Ratio of ORs (95% CI)",
+    width = 2.3
+  ) %>%
+  width(
+    j = "p-value",
+    width = 1
+  ) %>%
+  set_table_properties(
+    layout = "fixed",
+    width = 1,
+    opts_word = list(
+      split = FALSE,
+      repeat_headers = TRUE
+    )
+  ) %>%
+  add_footer_lines(
+    values = c2_note
+  ) %>%
+  italic(part = "footer") %>%
+  fontsize(
+    size = 7.5,
+    part = "footer"
+  )
+
+save_as_docx(
+  table_c2_ft,
+  path = "Appendix_Table_C2_Route_Interactions.docx",
+  pr_section = prop_section(
+    page_size = page_size(
+      orient = "portrait"
+    ),
+    page_margins = page_mar(
+      top = 0.6,
+      bottom = 0.6,
+      left = 0.6,
+      right = 0.6
+    )
+  )
+)
+```
+
+
+# Step 8
+## Check
+```{r}
+stopifnot(
+  person_period_data %>%
+    group_by(ResponseId) %>%
+    summarise(
+      number_of_events = sum(event, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    summarise(
+      maximum_events = max(number_of_events)
+    ) %>%
+    pull(maximum_events) <= 1
+)
+```
+
+
+## Step 4.5: Node-level residual diagnostics for pooled Model 4
+```{r}
+# 1. Confirm the selected pooled model and required objects
+stopifnot(
+  exists("mod4"),
+  exists("model_compare_agg"),
+  exists("model_common_raw"),
+  exists("pre_route_nodes")
+)
+
+cat(
+  "Model used for Section 4.5: mod4\n",
+  "Formula:",
+  paste(deparse(formula(mod4)), collapse = " "),
+  "\n"
+)
+
+# 2. Reconstruct the same model data while retaining node_id
+diagnostic_grouping_vars <- c(
+  "node_id",
+  "time_5_c",
+  "time_5_c_sq",
+  "route_simplified",
+  "has_text_entry",
+  "financial_sensitivity",
+  "privacy_level",
+  "is_long_choice",
+  "prompt_wc_10",
+  "prompt_wc_band_tertile"
+)
+
+model_compare_node_agg <- model_common_raw %>%
+  group_by(
+    across(all_of(diagnostic_grouping_vars))
+  ) %>%
+  summarise(
+    events = sum(events, na.rm = TRUE),
+    trials = sum(trials, na.rm = TRUE),
+    non_events = trials - events,
+    .groups = "drop"
+  ) %>%
+  filter(trials > 0) %>%
+  mutate(
+    across(where(is.factor), fct_drop)
+  )
+
+stopifnot(
+  sum(model_compare_node_agg$trials) ==
+    sum(model_compare_agg$trials),
+
+  sum(model_compare_node_agg$events) ==
+    sum(model_compare_agg$events)
+)
+# 3. Obtain predictions from the existing mod4 model
+# Use a new name so the dispersion_ratio() function is not overwritten
+phi_mod4 <- sum(
+  residuals(mod4, type = "pearson")^2
+) / df.residual(mod4)
+
+cat(
+  "Model 4 dispersion ratio:",
+  round(phi_mod4, 3),
+  "\n"
+)
+
+cell_diagnostics <- model_compare_node_agg %>%
+  mutate(
+    predicted_hazard = predict(
+      mod4,
+      newdata = model_compare_node_agg,
+      type = "response"
+    ),
+
+    predicted_hazard = pmin(
+      pmax(predicted_hazard, 1e-8),
+      1 - 1e-8
+    ),
+
+    expected_events =
+      trials * predicted_hazard,
+
+    binomial_variance =
+      trials *
+      predicted_hazard *
+      (1 - predicted_hazard),
+
+    # pre_route_nodes was defined before the route-specific models
+    analysis_panel = case_when(
+      node_id %in% pre_route_nodes ~
+        "Pre-route / common nodes",
+
+      as.character(route_simplified) %in%
+        c("owner_main", "repeated_dogs_loop") ~
+        "Dog-owner route",
+
+      as.character(route_simplified) ==
+        "non_owner_exit" ~
+        "Non-owner route",
+
+      TRUE ~
+        "Unclassified"
+    ),
+
+    analysis_panel = factor(
+      analysis_panel,
+      levels = c(
+        "Pre-route / common nodes",
+        "Dog-owner route",
+        "Non-owner route",
+        "Unclassified"
+      )
+    )
+  )
+
+# No observations should remain unclassified
+stopifnot(
+  sum(
+    cell_diagnostics$analysis_panel ==
+      "Unclassified",
+    na.rm = TRUE
+  ) == 0
+)
+```
+
+
+```{r}
+# 5. Aggregate predictions and residuals to node level
+node_residual_data <- cell_diagnostics %>%
+  group_by(
+    analysis_panel,
+    node_id
+  ) %>%
+  summarise(
+    trials =
+      sum(trials, na.rm = TRUE),
+
+    events =
+      sum(events, na.rm = TRUE),
+
+    expected_events =
+      sum(expected_events, na.rm = TRUE),
+
+    total_binomial_variance =
+      sum(binomial_variance, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    observed_hazard =
+      events / trials,
+
+    predicted_hazard =
+      expected_events / trials,
+
+    hazard_difference =
+      observed_hazard -
+      predicted_hazard,
+
+    excess_breakoffs =
+      events -
+      expected_events,
+
+    observed_expected_ratio =
+      if_else(
+        expected_events > 0,
+        events / expected_events,
+        NA_real_
+      ),
+
+    standardized_residual =
+      excess_breakoffs /
+      sqrt(
+        phi_mod4 *
+          total_binomial_variance
+      )
+  ) %>%
+  group_by(analysis_panel) %>%
+  mutate(
+    panel_breakoff_share_pct =
+      100 * events / sum(events)
+  ) %>%
+  ungroup() %>%
+  arrange(
+    analysis_panel,
+    desc(standardized_residual)
+  )
+
+node_residual_data
+```
+
+
+## Appendix D1: Full_Node_Residual_Diagnostics
+```{r}
+d1_results <- node_residual_data %>%
+  filter(
+    excess_breakoffs > 0,
+    is.finite(standardized_residual)
+  ) %>%
+  group_by(analysis_panel) %>%
+  slice_max(
+    order_by = standardized_residual,
+    n = 5,
+    with_ties = FALSE
+  ) %>%
+  arrange(
+    desc(standardized_residual),
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    Rank = row_number()
+  ) %>%
+  ungroup() %>%
+  transmute(
+    Panel = as.character(analysis_panel),
+    Rank,
+    Node = node_id,
+    `At risk` = trials,
+    Breakoffs = events,
+    `Observed hazard` = observed_hazard,
+    `Predicted hazard` = predicted_hazard,
+    `O/E ratio` = observed_expected_ratio,
+    `Standardized residual` = standardized_residual
+  )
+
+print(
+  d1_results,
+  n = Inf,
+  width = Inf
+)
+
+write_csv(
+  node_residual_data %>%
+    arrange(
+      analysis_panel,
+      desc(standardized_residual)
+    ),
+  "Full_Node_Residual_Diagnostics.csv"
+)
+```
+
+## Appendix_Table_D1_Residual_Diagnostics
+```{r}
+table_d1 <- d1_results %>%
+  mutate(
+    Panel = factor(
+      Panel,
+      levels = c(
+        "Pre-route / common nodes",
+        "Dog-owner route",
+        "Non-owner route"
+      ),
+      labels = c(
+        "Pre-route / common",
+        "Dog-owner",
+        "Non-owner"
+      )
+    )
+  ) %>%
+  arrange(Panel, Rank) %>%
+  transmute(
+    Panel = as.character(Panel),
+    Rank = as.character(Rank),
+
+    Node = gsub(
+      "_",
+      "_\n",
+      Node,
+      fixed = TRUE
+    ),
+
+    `At risk` = scales::comma(
+      `At risk`,
+      accuracy = 1
+    ),
+
+    Breakoffs = scales::comma(
+      Breakoffs,
+      accuracy = 1
+    ),
+
+    `Observed / predicted hazard` = sprintf(
+      "%.2f%% / %.2f%%",
+      100 * `Observed hazard`,
+      100 * `Predicted hazard`
+    ),
+
+    `O/E ratio` = sprintf(
+      "%.2f",
+      `O/E ratio`
+    ),
+
+    `Standardized residual` = sprintf(
+      "%.2f",
+      `Standardized residual`
+    )
+  )
+
+table_d1_ft <- flextable(table_d1) %>%
+  set_caption(
+    "Table D1. Largest positive standardized residuals by analytical panel"
+  ) %>%
+  set_header_labels(
+    `At risk` = "At\nrisk",
+    `Observed / predicted hazard` =
+      "Observed /\npredicted hazard",
+    `O/E ratio` = "O/E\nratio",
+    `Standardized residual` =
+      "Standardized\nresidual"
+  ) %>%
+  theme_booktabs() %>%
+  font(
+    fontname = "Times New Roman",
+    part = "all"
+  ) %>%
+  fontsize(
+    size = 7.5,
+    part = "all"
+  ) %>%
+  bold(part = "header") %>%
+  align(
+    j = c(
+      "Rank",
+      "At risk",
+      "Breakoffs",
+      "Observed / predicted hazard",
+      "O/E ratio",
+      "Standardized residual"
+    ),
+    align = "center",
+    part = "all"
+  ) %>%
+  align(
+    j = c("Panel", "Node"),
+    align = "left",
+    part = "body"
+  ) %>%
+  valign(
+    valign = "top",
+    part = "all"
+  ) %>%
+  padding(
+    padding = 2,
+    part = "all"
+  ) %>%
+  width(j = "Panel", width = 0.85) %>%
+  width(j = "Rank", width = 0.35) %>%
+  width(j = "Node", width = 1.30) %>%
+  width(j = "At risk", width = 0.65) %>%
+  width(j = "Breakoffs", width = 0.65) %>%
+  width(
+    j = "Observed / predicted hazard",
+    width = 1.20
+  ) %>%
+  width(j = "O/E ratio", width = 0.50) %>%
+  width(
+    j = "Standardized residual",
+    width = 0.70
+  ) %>%
+  set_table_properties(
+    layout = "fixed",
+    width = 1,
+    opts_word = list(
+      split = FALSE,
+      repeat_headers = TRUE
+    )
+  ) %>%
+  add_footer_lines(
+    paste(
+      "Notes: Nodes were ranked separately within each analytical panel",
+      "by their positive dispersion-adjusted standardized residuals.",
+      "Up to five nodes are reported per panel; fewer are displayed when",
+      "fewer than five positive residuals were available. Observed and",
+      "predicted hazards are reported in that order. O/E denotes the",
+      "observed-to-expected event ratio. Residuals are descriptive model",
+      "diagnostics and should not be interpreted as causal effects."
+    )
+  ) %>%
+  italic(part = "footer") %>%
+  fontsize(
+    size = 7,
+    part = "footer"
+  )
+
+save_as_docx(
+  table_d1_ft,
+  path = "Appendix_Table_D1_Residual_Diagnostics.docx",
+  pr_section = prop_section(
+    page_size = page_size(
+      orient = "portrait"
+    ),
+    page_margins = page_mar(
+      top = 0.6,
+      bottom = 0.6,
+      left = 0.6,
+      right = 0.6
+    )
+  )
+)
+```
+
+
+
+
+## Figure_6_Observed_vs_Predicted_Hazards_by_Route
+```{r}
+# Label up to five largest positive residuals in each panel
+label_nodes <- node_residual_data %>%
+  filter(
+    excess_breakoffs > 0,
+    is.finite(standardized_residual)
+  ) %>%
+  group_by(analysis_panel) %>%
+  slice_max(
+    order_by = standardized_residual,
+    n = 5,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+# Use the same x- and y-axis limits across all panels
+axis_max <- max(
+  c(
+    node_residual_data$observed_hazard,
+    node_residual_data$predicted_hazard
+  ),
+  na.rm = TRUE
+) * 1.05
+
+figure_observed_predicted <- ggplot(
+  node_residual_data,
+  aes(
+    x = predicted_hazard,
+    y = observed_hazard,
+    size = trials
+  )
+) +
+  # Perfect prediction line
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    colour = "grey45",
+    linewidth = 0.7
+  ) +
+
+  # All questionnaire nodes
+  geom_point(
+    colour = "#2C6E9B",
+    alpha = 0.60
+  ) +
+
+  # Highlight residual hotspots
+  geom_point(
+    data = label_nodes,
+    colour = "#B03A2E",
+    alpha = 0.90
+  ) +
+
+  # Node labels
+  geom_text_repel(
+    data = label_nodes,
+    aes(label = node_id),
+    size = 3.4,
+    colour = "#7B241C",
+    box.padding = 0.45,
+    point.padding = 0.30,
+    min.segment.length = 0,
+    max.overlaps = Inf,
+    seed = 123,
+    show.legend = FALSE
+  ) +
+
+  facet_wrap(
+    ~ analysis_panel,
+    ncol = 1,
+    drop = TRUE
+  ) +
+
+  scale_x_continuous(
+    labels = label_percent(accuracy = 0.1),
+    expand = expansion(mult = c(0.01, 0.03))
+  ) +
+
+  scale_y_continuous(
+    labels = label_percent(accuracy = 0.1),
+    expand = expansion(mult = c(0.01, 0.03))
+  ) +
+
+  scale_size_area(
+    max_size = 10,
+    labels = label_comma()
+  ) +
+
+  coord_cartesian(
+  xlim = c(0, axis_max),
+  ylim = c(0, axis_max),
+  clip = "off"
+  ) +
+
+  labs(
+    title = paste(
+      "Observed and pooled-model-predicted",
+      "node-level breakoff hazards"
+    ),
+    subtitle = paste(
+      "Predictions are from the final pooled",
+      "quasibinomial discrete-time hazard model"
+    ),
+    x = "Model-predicted conditional breakoff hazard",
+    y = "Observed conditional breakoff hazard",
+    size = "Respondent-node exposures",
+    caption = paste0(
+  "The dashed equality line represents exact agreement.\n",
+  "Labels identify up to five nodes with the largest positive ",
+  "dispersion-scaled residuals in each panel."
+)
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    strip.background = element_rect(
+      fill = "#EDF2F7",
+      colour = NA
+    ),
+    strip.text = element_text(
+      face = "bold"
+    ),
+    legend.position = "bottom",
+    plot.title = element_text(
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      colour = "grey30"
+    ),
+    plot.caption = element_text(
+      colour = "grey35",
+      hjust = 0
+    ),
+    plot.margin = margin(
+      t = 10,
+      r = 30,
+      b = 10,
+      l = 10
+    )
+  )
+
+figure_observed_predicted
+
+ggsave(
+  filename =
+    "figure6-observed-predicted-hazards-by-route.png",
+  plot = figure_observed_predicted,
+  width = 7.2,
+  height = 10.8,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+
+```{r}
+panel_model_fit_summary <- cell_diagnostics %>%
+  group_by(analysis_panel) %>%
+  summarise(
+    number_of_nodes =
+      n_distinct(node_id),
+
+    exposures =
+      sum(trials, na.rm = TRUE),
+
+    observed_events =
+      sum(events, na.rm = TRUE),
+
+    predicted_events =
+      sum(expected_events, na.rm = TRUE),
+
+    excess_breakoffs =
+      observed_events - predicted_events,
+
+    observed_hazard =
+      observed_events / exposures,
+
+    predicted_hazard =
+      predicted_events / exposures,
+
+    observed_expected_ratio =
+      observed_events / predicted_events,
+
+    .groups = "drop"
+  )
+
+print(
+  panel_model_fit_summary,
+  n = Inf,
+  width = Inf
+)
+```
+
+
+```{r}
+overall_model_fit_summary <- cell_diagnostics %>%
+  summarise(
+    exposures =
+      sum(trials, na.rm = TRUE),
+
+    observed_events =
+      sum(events, na.rm = TRUE),
+
+    predicted_events =
+      sum(expected_events, na.rm = TRUE),
+
+    prediction_difference =
+      observed_events - predicted_events,
+
+    observed_hazard =
+      observed_events / exposures,
+
+    predicted_hazard =
+      predicted_events / exposures
+  )
+
+overall_model_fit_summary
+```
+
+## table 6
+```{r}
+selected_hotspot_lookup <- tribble(
+  ~node_id, ~question_topic, ~response_format, ~display_order,
+
+  "Q1_DogNumber",
+  "Number of dogs owned",
+  "Single choice",
+  1,
+
+  "Q13.2_HolidayAccommo",
+  "Holiday accommodation arrangements",
+  "Multiple choice with optional text",
+  2,
+
+  "Q17.1_ServicesCutCoL",
+  "Services reduced due to cost of living",
+  "Multiple choice",
+  3,
+
+  "Q22_ImproveLife",
+  "Ways to improve dogs' lives",
+  "Open text",
+  4,
+
+  "Q26_Ethnicity",
+  "Respondent ethnicity",
+  "Choice list with optional text",
+  5,
+
+  "E2FutureDogOwner",
+  "Future dog ownership",
+  "Single choice",
+  6,
+
+  "E3_FutureDogSource",
+  "Expected source of a future dog",
+  "Multiple choice",
+  7,
+
+  "E3.1_NotRescue",
+  "Reasons for not using a rescue",
+  "Multiple choice",
+  8
+)
+
+selected_hotspot_profiles <-
+  node_residual_data %>%
+  inner_join(
+    selected_hotspot_lookup,
+    by = "node_id"
+  ) %>%
+  arrange(display_order)
+
+stopifnot(
+  nrow(selected_hotspot_profiles) == 8,
+  !anyNA(selected_hotspot_profiles$question_topic),
+  !anyNA(selected_hotspot_profiles$response_format)
+)
+
+selected_hotspot_profiles_display <-
+  selected_hotspot_profiles %>%
+  transmute(
+    Panel = as.character(analysis_panel),
+
+    Node = node_id,
+
+    `Question topic` = question_topic,
+
+    `Response format` = response_format,
+
+    `Observed hazard` = scales::percent(
+      observed_hazard,
+      accuracy = 0.01
+    ),
+
+    `Predicted hazard` = scales::percent(
+      predicted_hazard,
+      accuracy = 0.01
+    ),
+
+    `O/E ratio` = sprintf(
+      "%.2f",
+      observed_expected_ratio
+    ),
+
+    `Excess breakoffs` = scales::comma(
+      round(excess_breakoffs),
+      accuracy = 1
+    )
+  )
+
+print(
+  selected_hotspot_profiles_display,
+  n = Inf,
+  width = Inf
+)
+```
+
+
+```{r}
+hotspot_profile_table <- selected_hotspot_profiles_display %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  bold(
+    part = "header"
+  ) %>%
+  align(
+    j = c(
+      "Observed hazard",
+      "Predicted hazard",
+      "O/E ratio",
+      "Excess breakoffs"
+    ),
+    align = "center",
+    part = "all"
+  ) %>%
+  valign(
+    valign = "top",
+    part = "all"
+  ) %>%
+  autofit() %>%
+  fontsize(
+    size = 9,
+    part = "all"
+  ) %>%
+  set_caption(
+    caption =
+      "Table 6. Selected residual hotspot profiles"
+  ) %>%
+  add_footer_lines(
+    values = paste(
+      "Notes: O/E denotes the observed-to-expected event ratio.",
+      "Excess breakoffs are descriptive model residuals and should",
+      "not be interpreted as the number of breakoffs that would",
+      "necessarily be prevented by redesigning the question."
+    )
+  )
+
+hotspot_profile_table
+```
+
+
+```{r}
+# Portrait version: Selected residual hotspot profiles
+# 1. Prepare a narrower display table
+hotspot_profile_portrait <- selected_hotspot_profiles_display %>%
+  transmute(
+    Route = gsub(
+  " route$| / common nodes$",
+  "",
+  as.character(Panel)
+),
+
+    # Allow long node names to wrap
+    Node = gsub(
+      "_",
+      "_\n",
+      Node,
+      fixed = TRUE
+    ),
+
+    `Question topic` = `Question topic`,
+
+    `Response format` = `Response format`,
+
+    `Observed / predicted hazard` = paste0(
+      `Observed hazard`,
+      " / ",
+      `Predicted hazard`
+    ),
+
+    `O/E ratio` = `O/E ratio`,
+
+    `Excess breakoffs` = `Excess breakoffs`
+  )
+
+
+# 2. Create the portrait table
+hotspot_profile_table <- hotspot_profile_portrait %>%
+  flextable() %>%
+
+  set_header_labels(
+    Route = "Route",
+    Node = "Node",
+    `Question topic` = "Question topic",
+    `Response format` = "Response\nformat",
+    `Observed / predicted hazard` =
+      "Observed /\npredicted hazard",
+    `O/E ratio` = "O/E\nratio",
+    `Excess breakoffs` = "Excess\nbreakoffs"
+  ) %>%
+
+  theme_booktabs() %>%
+
+  # Fixed layout prevents long text from expanding the table
+  set_table_properties(
+    layout = "fixed",
+    width = 1,
+    align = "center"
+  ) %>%
+
+  # Column widths suitable for a portrait page
+  width(
+    j = "Route",
+    width = 0.65
+  ) %>%
+
+  width(
+    j = "Node",
+    width = 0.90
+  ) %>%
+
+  width(
+    j = "Question topic",
+    width = 1.55
+  ) %>%
+
+  width(
+    j = "Response format",
+    width = 0.85
+  ) %>%
+
+  width(
+    j = "Observed / predicted hazard",
+    width = 0.95
+  ) %>%
+
+  width(
+    j = "O/E ratio",
+    width = 0.45
+  ) %>%
+
+  width(
+    j = "Excess breakoffs",
+    width = 0.65
+  ) %>%
+
+  # Formatting
+  font(
+    fontname = "Times New Roman",
+    part = "all"
+  ) %>%
+
+  fontsize(
+    size = 8,
+    part = "all"
+  ) %>%
+
+  bold(
+    part = "header"
+  ) %>%
+
+  align(
+    j = c(
+      "Observed / predicted hazard",
+      "O/E ratio",
+      "Excess breakoffs"
+    ),
+    align = "center",
+    part = "all"
+  ) %>%
+
+  align(
+    j = c(
+      "Route",
+      "Node",
+      "Question topic",
+      "Response format"
+    ),
+    align = "left",
+    part = "body"
+  ) %>%
+
+  valign(
+    valign = "top",
+    part = "all"
+  ) %>%
+
+  padding(
+    padding.top = 3,
+    padding.bottom = 3,
+    padding.left = 2,
+    padding.right = 2,
+    part = "all"
+  ) %>%
+
+  set_caption(
+    caption =
+      "Table 6. Selected residual hotspot profiles"
+  ) %>%
+
+  add_footer_lines(
+    values = paste(
+      "Notes: Observed and predicted hazards are reported in that order.",
+      "O/E denotes the observed-to-expected event ratio.",
+      "Excess breakoffs are descriptive model residuals and should not",
+      "be interpreted as the number of breakoffs that would necessarily",
+      "be prevented by redesigning the question."
+    )
+  ) %>%
+
+  italic(
+    part = "footer"
+  ) %>%
+
+  fontsize(
+    size = 7,
+    part = "footer"
+  )
+
+
+# 3. Display the table in R
+hotspot_profile_table
+```
+
+
+
+```{r}
+output_file <-
+  "Table_Selected_Residual_Hotspot_Profiles_Portrait.docx"
+
+save_as_docx(
+  hotspot_profile_table,
+  path = output_file
+)
+```
+
+
+
+## output svg figure
+```{r}
+# Create output folder if it does not already exist
+dir.create(
+  "media/figures",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+save_svg <- function(plot_object,
+                     filename,
+                     width,
+                     height) {
+
+  ggsave(
+    filename = file.path(
+      "media/figures",
+      filename
+    ),
+    plot = plot_object,
+    device = svglite::svglite,
+    width = width,
+    height = height,
+    units = "in",
+    bg = "white"
+  )
+}
+
+
+# Figure 3: overall and route-conditional survival
+save_svg(
+  plot_object = figure3_overall_route_survival,
+  filename =
+    "figure3-overall-route-survival.svg",
+  width = 10,
+  height = 10
+)
+
+
+# Figure 4: raw attrition hotspots
+save_svg(
+  plot_object = figure4_raw_attrition_hotspots,
+  filename =
+    "figure4-raw-attrition-hotspots.svg",
+  width = 7.2,
+  height = 8.4
+)
+
+
+# Figure 5: adjusted odds ratios from Model 4
+save_svg(
+  plot_object = figure5_model4_adjusted_odds_ratios,
+  filename =
+    "figure5-model4-adjusted-odds-ratios.svg",
+  width = 7.2,
+  height = 4.8
+)
+
+
+# Figure 6: observed versus predicted hazards
+save_svg(
+  plot_object = figure_observed_predicted,
+  filename =
+    "figure6-observed-predicted-hazards-by-route.svg",
+  width = 7.2,
+  height = 10.8
+)
+```
+
+
+
+
+
+
+
+
